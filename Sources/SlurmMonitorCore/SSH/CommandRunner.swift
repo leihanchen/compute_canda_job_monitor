@@ -149,7 +149,7 @@ private final class ProcessExecution: @unchecked Sendable {
 
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
-            self?.drainPipe(fd: fd, isStdout: isStdout, source: source)
+            self?.drainPipe(fd: fd, isStdout: isStdout)
         }
         source.setCancelHandler {
             try? handle.close()
@@ -157,7 +157,7 @@ private final class ProcessExecution: @unchecked Sendable {
         return source
     }
 
-    private func drainPipe(fd: Int32, isStdout: Bool, source: DispatchSourceRead) {
+    private func drainPipe(fd: Int32, isStdout: Bool) {
         var buffer = [UInt8](repeating: 0, count: 65_536)
         while true {
             let count = Darwin.read(fd, &buffer, buffer.count)
@@ -168,7 +168,7 @@ private final class ProcessExecution: @unchecked Sendable {
                     stderrData.append(contentsOf: buffer[..<count])
                 }
             } else if count == 0 {
-                markEOF(isStdout: isStdout, source: source)
+                markEOF(isStdout: isStdout)
                 return
             } else {
                 if errno == EINTR {
@@ -177,21 +177,22 @@ private final class ProcessExecution: @unchecked Sendable {
                 if errno == EAGAIN || errno == EWOULDBLOCK {
                     return
                 }
-                markEOF(isStdout: isStdout, source: source)
+                markEOF(isStdout: isStdout)
                 return
             }
         }
     }
 
-    private func markEOF(isStdout: Bool, source: DispatchSourceRead) {
+    private func markEOF(isStdout: Bool) {
         if isStdout {
             stdoutEOF = true
+            stdoutSource?.cancel()
             stdoutSource = nil
         } else {
             stderrEOF = true
+            stderrSource?.cancel()
             stderrSource = nil
         }
-        source.cancel()
         finishIfReady()
     }
 

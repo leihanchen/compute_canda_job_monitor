@@ -30,6 +30,8 @@ public enum GeneratedSSHConfig {
             switch key {
             case "identityfile":
                 appendIdentityFiles(cluster: cluster, sshG: sshG, to: &lines)
+            case "identityagent":
+                appendValues(sshG["identityagent"], key: "identityagent", fallback: nil, quoteWhitespace: true, to: &lines)
             case "hostname":
                 appendValues(sshG["hostname"], key: "hostname", fallback: cluster.host, to: &lines)
             case "user":
@@ -106,6 +108,7 @@ public enum GeneratedSSHConfig {
         _ values: [String]?,
         key: String,
         fallback: String?,
+        quoteWhitespace: Bool = false,
         to lines: inout [String]
     ) {
         let valid = (values ?? [])
@@ -114,13 +117,15 @@ public enum GeneratedSSHConfig {
 
         if valid.isEmpty {
             if let fallback = fallback?.trimmingCharacters(in: .whitespaces), !fallback.isEmpty {
-                lines.append("  \(key) \(fallback)")
+                let formatted = quoteWhitespace ? quoteIfNeeded(fallback) : fallback
+                lines.append("  \(key) \(formatted)")
             }
             return
         }
 
         for value in valid {
-            lines.append("  \(key) \(value)")
+            let formatted = quoteWhitespace ? quoteIfNeeded(value) : value
+            lines.append("  \(key) \(formatted)")
         }
     }
 
@@ -152,8 +157,14 @@ public enum GeneratedSSHConfig {
             let canonical = URL(fileURLWithPath: expanded).standardizedFileURL.path
             guard seenCanonicalPaths.insert(canonical).inserted else { continue }
 
-            let formatted = trimmed.contains(where: \.isWhitespace) ? "\"\(trimmed)\"" : trimmed
-            lines.append("  identityfile \(formatted)")
+            lines.append("  identityfile \(quoteIfNeeded(trimmed))")
         }
+    }
+
+    private static func quoteIfNeeded(_ value: String) -> String {
+        if value.contains(where: \.isWhitespace) && !(value.hasPrefix("\"") && value.hasSuffix("\"")) {
+            return "\"\(value)\""
+        }
+        return value
     }
 }

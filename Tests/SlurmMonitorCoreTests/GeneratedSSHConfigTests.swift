@@ -134,3 +134,21 @@ import Testing
     let fileAttrsAfter = try FileManager.default.attributesOfItem(atPath: fileURL.path)
     #expect((fileAttrsAfter[.posixPermissions] as? NSNumber)?.intValue == 0o600)
 }
+
+@Test func generatedBlockQuotesIdentityAgentWithSpacesAndPreservesMultiTokenDirectives() {
+    let onePasswordAgent = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+    let sshGText = """
+    hostname nibi.alliancecan.ca
+    user leihan
+    identityagent \(onePasswordAgent)
+    proxycommand ssh -W %h:%p bastion.example.org
+    userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2
+    """
+    let g = SSHGOutput.parse(sshGText)
+    let c = ClusterConfig(name: "nibi", host: "nibi.alliancecan.ca", username: "leihan")
+    let b = GeneratedSSHConfig.block(for: c, sshG: g, controlPath: "/tmp/cm-nibi")
+
+    #expect(b.contains("  identityagent \"\(onePasswordAgent)\"\n"))
+    #expect(b.contains("  proxycommand ssh -W %h:%p bastion.example.org\n"))
+    #expect(b.contains("  userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2\n"))
+}
