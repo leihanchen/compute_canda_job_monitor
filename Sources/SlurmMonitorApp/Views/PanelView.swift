@@ -12,14 +12,14 @@ private enum PanelTab: String, CaseIterable, Identifiable {
 
 private enum PanelSheet: Identifiable {
     case addCluster
-    case loginQueue([UUID])
+    case login
 
     var id: String {
         switch self {
         case .addCluster:
             return "addCluster"
-        case .loginQueue(let ids):
-            return "login-\(ids.map(\.uuidString).joined(separator: "-"))"
+        case .login:
+            return "login"
         }
     }
 }
@@ -40,7 +40,7 @@ struct PanelView: View {
                 header(dashboard: dashboard, now: now)
 
                 if env.model.clusters.isEmpty {
-                    emptyWelcomePlaceholder
+                    WelcomeView(isSheet: false)
                 } else {
                     Picker("Section", selection: $selectedTab) {
                         ForEach(PanelTab.allCases) { tab in
@@ -68,8 +68,11 @@ struct PanelView: View {
                 await env.refreshAll(.panelOpened)
             }
         }
-        .sheet(item: activeSheetBinding) { sheet in
+        .sheet(item: activeSheetBinding, onDismiss: {
+            env.handleSheetDismissed()
+        }) { sheet in
             sheetContent(for: sheet)
+                .environmentObject(env)
         }
     }
 
@@ -134,29 +137,6 @@ struct PanelView: View {
         }
     }
 
-    private var emptyWelcomePlaceholder: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Add your clusters")
-                    .font(.title3.weight(.semibold))
-                Text("No Slurm clusters configured yet. Add Alliance or custom clusters to monitor running and pending jobs.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack {
-                    Spacer()
-                    Button("Add clusters") {
-                        env.isAddingCluster = true
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                }
-            }
-            .padding(.vertical, 6)
-        }
-    }
-
     private var footer: some View {
         HStack(spacing: 12) {
             Spacer()
@@ -194,15 +174,18 @@ struct PanelView: View {
                 if env.isAddingCluster {
                     return .addCluster
                 }
-                if !env.loginQueue.isEmpty {
-                    return .loginQueue(env.loginQueue)
+                if env.activeLoginState != nil {
+                    return .login
                 }
                 return nil
             },
             set: { newValue in
                 if newValue == nil {
-                    env.isAddingCluster = false
-                    env.cancelLogin()
+                    if env.isAddingCluster {
+                        env.isAddingCluster = false
+                    } else if env.activeLoginState != nil {
+                        env.cancelLogin()
+                    }
                 }
             }
         )
@@ -212,43 +195,14 @@ struct PanelView: View {
     private func sheetContent(for sheet: PanelSheet) -> some View {
         switch sheet {
         case .addCluster:
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Add your clusters")
-                    .font(.headline)
-                Text("Welcome setup and cluster import will be connected here in the onboarding flow.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("Close") {
-                        env.isAddingCluster = false
-                    }
-                    .keyboardShortcut(.cancelAction)
-                }
-            }
-            .padding(16)
-            .frame(width: 320)
+            WelcomeView(isSheet: true)
 
-        case .loginQueue(let ids):
-            let names = ids.compactMap { id in
-                env.model.clusters.first(where: { $0.config.id == id })?.config.name
+        case .login:
+            if let state = env.activeLoginState {
+                LoginSheet(state: state)
+            } else {
+                EmptyView()
             }
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Cluster login")
-                    .font(.headline)
-                Text("Interactive MFA login sheet for \(names.joined(separator: ", ")) will be attached here in the login flow.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("Close") {
-                        env.cancelLogin()
-                    }
-                    .keyboardShortcut(.cancelAction)
-                }
-            }
-            .padding(16)
-            .frame(width: 320)
         }
     }
 

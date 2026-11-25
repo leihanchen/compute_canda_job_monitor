@@ -5,6 +5,7 @@ import SlurmMonitorCore
 /// Standard filesystem locations used by Slurm Monitor under `~/.slurm-monitor`.
 struct AppPaths: Sendable {
     let root: URL
+    let sshDirectory: URL
     let clusters: URL
     let cache: URL
     let sshConfig: URL
@@ -16,16 +17,18 @@ struct AppPaths: Sendable {
     init(
         root: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".slurm-monitor", isDirectory: true),
+        sshDirectory: URL? = nil,
         userSSHConfig: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".ssh", isDirectory: true)
             .appendingPathComponent("config", isDirectory: false),
         socketTemplate: String = "~/.slurm-monitor/cm-%C"
     ) {
         self.root = root
+        self.userSSHConfig = userSSHConfig
+        self.sshDirectory = sshDirectory ?? userSSHConfig.deletingLastPathComponent()
         self.clusters = root.appendingPathComponent("clusters.json", isDirectory: false)
         self.cache = root.appendingPathComponent("cache", isDirectory: true)
         self.sshConfig = root.appendingPathComponent("ssh_config", isDirectory: false)
-        self.userSSHConfig = userSSHConfig
         self.socketTemplate = socketTemplate
     }
 }
@@ -52,16 +55,21 @@ final class AppEnvironment: ObservableObject {
 
     @Published private(set) var isRefreshing = false
 
-    // Presentation hooks extended in Task 12 (WelcomeView / LoginSheet).
+    // Presentation hooks for WelcomeView / LoginSheet.
     @Published var isAddingCluster = false
     @Published var loginQueue: [UUID] = []
+    @Published private(set) var activeLoginState: ActiveLoginState?
+    @Published private(set) var loginErrors: [UUID: ClusterError] = [:]
 
     // Platform hook extended in Task 13 (StayAwakeController / SystemEventsMonitor).
     var onStateChange: (@MainActor () -> Void)?
 
     private let userDefaults: UserDefaults
+    private let loginExecutable: String
     private var cancellables: Set<AnyCancellable> = []
     private var timerTask: Task<Void, Never>?
+    private var loginTask: Task<Void, Never>?
+    private var loginGeneration: UInt64 = 0
     private var activeSSHConfigTask: Task<Void, Never>?
     private var requestedSSHConfigGeneration: UInt64 = 0
     private var attemptedSSHConfigGeneration: UInt64 = 0
@@ -69,16 +77,20 @@ final class AppEnvironment: ObservableObject {
     private var lastUserSSHConfigMTime: Date?
     private var activeRefreshCount = 0
     private var didBootstrap = false
+    private var pendingLoginAfterAddSheet: [UUID] = []
+    private var resolvedControlPaths: [UUID: String] = [:]
 
     init(
         paths: AppPaths = .default,
         runner: CommandRunner = ProcessCommandRunner(),
         userDefaults: UserDefaults = .standard,
+        loginExecutable: String = "/usr/bin/ssh",
         autoStart: Bool = true
     ) {
         self.paths = paths
         self.runner = runner
         self.userDefaults = userDefaults
+        self.loginExecutable = loginExecutable
 
         var loadedSettings = AppSettings.load(from: userDefaults)
         loadedSettings.refreshIntervalMinutes = Self.clampedIntervalMinutes(loadedSettings.refreshIntervalMinutes)
@@ -164,28 +176,131 @@ final class AppEnvironment: ObservableObject {
 
         await regenerateSSHConfigIfUserConfigChanged()
         await model.refreshAll(reason)
+        clearResolvedLoginErrors()
     }
 
     /// Persists updated cluster definitions, regenerates the app SSH config, and refreshes non-interactively.
     func saveClusters(_ configs: [ClusterConfig], refreshTargetID: UUID? = nil) async throws {
         try model.setClusters(configs)
+        let validIDs = Set(configs.map(\.id))
+        loginErrors = loginErrors.filter { validIDs.contains($0.key) }
+        resolvedControlPaths = resolvedControlPaths.filter { validIDs.contains($0.key) }
+        if let refreshTargetID {
+            loginErrors.removeValue(forKey: refreshTargetID)
+        }
         await regenerateSSHConfig()
         if let refreshTargetID {
             await model.refresh(refreshTargetID, .manual)
+            syncLoginError(for: refreshTargetID)
         }
         onStateChange?()
     }
 
-    /// Queues interactive login for the specified cluster IDs (implemented with `LoginSheet` in Task 12).
+    /// Walks `ids` sequentially, probing existing shared connections and presenting `LoginSheet` only when login is required.
     func login(_ ids: [UUID]) {
+        var seen = Set<UUID>()
         let validIDs = Set(model.clusters.filter(\.config.enabled).map(\.config.id))
-        let filtered = ids.filter { validIDs.contains($0) }
+        let filtered = ids.filter { validIDs.contains($0) && seen.insert($0).inserted }
+
+        cancelLogin()
+        guard !filtered.isEmpty else { return }
+
+        loginGeneration &+= 1
+        let generation = loginGeneration
         loginQueue = filtered
+        loginTask = Task { @MainActor [weak self] in
+            await self?.runLoginQueue(filtered, generation: generation)
+        }
     }
 
-    /// Clears any queued login presentation state.
+    /// Closes the add-cluster sheet and launches `login(_:)` once sheet dismissal completes.
+    func dismissAddClusterSheetAndLogin(_ ids: [UUID]) {
+        pendingLoginAfterAddSheet = ids
+        isAddingCluster = false
+    }
+
+    /// Runs any deferred login queue after the add-cluster sheet finishes dismissing.
+    func handleSheetDismissed() {
+        guard !isAddingCluster, !pendingLoginAfterAddSheet.isEmpty else { return }
+        let ids = pendingLoginAfterAddSheet
+        pendingLoginAfterAddSheet = []
+        login(ids)
+    }
+
+    /// Cancels any active interactive login session and clears queued login state.
     func cancelLogin() {
+        loginGeneration &+= 1
+        pendingLoginAfterAddSheet = []
+        if case .session(let controller) = activeLoginState {
+            controller.stop()
+        }
+        loginTask?.cancel()
+        loginTask = nil
+        activeLoginState = nil
         loginQueue = []
+
+        for view in model.clusters where view.status == .loggingIn {
+            model.setLoggingIn(view.config.id, false)
+        }
+        onStateChange?()
+    }
+
+    /// Returns a cached or expanded default socket path immediately for display before async `ssh -G` resolution completes.
+    func immediateControlPath(for cluster: ClusterConfig) -> String {
+        if let cached = resolvedControlPaths[cluster.id], !cached.isEmpty {
+            return cached
+        }
+        let userConfigText = (try? String(contentsOf: paths.userSSHConfig, encoding: .utf8)) ?? ""
+        let template = ControlPathResolver.userTemplate(
+            configText: userConfigText,
+            alias: cluster.sshAlias,
+            hostName: cluster.host
+        ) ?? paths.socketTemplate
+        return NSString(string: template).expandingTildeInPath
+    }
+
+    /// Resolves the live `ControlPath` socket path for `cluster` and reports whether `~/.ssh/config` already defines one.
+    func resolvedControlPathInfo(for cluster: ClusterConfig) async -> (controlPath: String, fromUserConfig: Bool) {
+        let userConfigText = (try? String(contentsOf: paths.userSSHConfig, encoding: .utf8)) ?? ""
+        let userTemplate = ControlPathResolver.userTemplate(
+            configText: userConfigText,
+            alias: cluster.sshAlias,
+            hostName: cluster.host
+        )
+        let resolved = await ControlPathResolver.resolve(
+            cluster: cluster,
+            userConfigText: userConfigText,
+            appTemplate: paths.socketTemplate,
+            runner: runner
+        )
+        return (resolved.controlPath, userTemplate != nil)
+    }
+
+    /// Formats an optional `~/.ssh/config` block allowing Terminal sessions to share the app's `ControlPath` socket.
+    func sshReuseSnippet(for cluster: ClusterConfig, controlPath: String) -> String {
+        let trimmedAlias = cluster.sshAlias?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedName = cluster.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostAlias: String
+        if !trimmedAlias.isEmpty {
+            hostAlias = trimmedAlias
+        } else if !trimmedName.isEmpty && !trimmedName.contains(where: \.isWhitespace) {
+            hostAlias = trimmedName
+        } else {
+            hostAlias = cluster.generatedAlias
+        }
+
+        let formattedPath = controlPath.contains(where: \.isWhitespace)
+            ? "\"\(controlPath)\""
+            : controlPath
+
+        return """
+        Host \(hostAlias)
+          HostName \(cluster.host)
+          User \(cluster.username)
+          ControlMaster auto
+          ControlPath \(formattedPath)
+          ControlPersist yes
+        """
     }
 
     /// Username shown in the panel header, preferring the first enabled cluster.
@@ -214,6 +329,147 @@ final class AppEnvironment: ObservableObject {
             .map(\.config.id)
     }
 
+    private func runLoginQueue(_ ids: [UUID], generation: UInt64) async {
+        defer {
+            if loginGeneration == generation {
+                loginTask = nil
+                activeLoginState = nil
+                loginQueue = []
+                onStateChange?()
+            }
+        }
+
+        await regenerateSSHConfigIfUserConfigChanged()
+        guard !Task.isCancelled, loginGeneration == generation else { return }
+
+        for (index, id) in ids.enumerated() {
+            guard !Task.isCancelled, loginGeneration == generation else { break }
+            let shouldContinue = await processQueuedCluster(
+                id: id,
+                position: index + 1,
+                total: ids.count,
+                generation: generation
+            )
+            if !shouldContinue {
+                break
+            }
+        }
+    }
+
+    private func processQueuedCluster(
+        id: UUID,
+        position: Int,
+        total: Int,
+        generation: UInt64
+    ) async -> Bool {
+        guard let cluster = model.clusters.first(where: { $0.config.id == id && $0.config.enabled })?.config else {
+            return true
+        }
+
+        loginErrors.removeValue(forKey: id)
+        model.setLoggingIn(id, true)
+        var didResetLoggingIn = false
+        defer {
+            if !didResetLoggingIn {
+                model.setLoggingIn(id, false)
+            }
+        }
+
+        if activeLoginState != nil {
+            activeLoginState = .preparing(
+                cluster: cluster,
+                position: position,
+                total: total,
+                status: "Checking existing connection…"
+            )
+        }
+
+        let transport = SharedSSHTransport(
+            alias: cluster.generatedAlias,
+            configPath: paths.sshConfig.path,
+            runner: runner
+        )
+
+        if await transport.probe() == .usable {
+            guard !Task.isCancelled, loginGeneration == generation else { return false }
+            model.setLoggingIn(id, false)
+            didResetLoggingIn = true
+            await model.refresh(id, .afterLogin)
+            syncLoginError(for: id)
+            onStateChange?()
+            return true
+        }
+
+        guard !Task.isCancelled, loginGeneration == generation else { return false }
+
+        if activeLoginState != nil {
+            activeLoginState = .preparing(
+                cluster: cluster,
+                position: position,
+                total: total,
+                status: "Freeing stale socket…"
+            )
+        }
+
+        await transport.stopStaleMaster()
+        guard !Task.isCancelled, loginGeneration == generation else { return false }
+
+        let controller = LoginSessionController(
+            cluster: cluster,
+            configPath: paths.sshConfig.path,
+            position: position,
+            total: total,
+            executable: loginExecutable
+        )
+        activeLoginState = .session(controller)
+
+        let outcome = await controller.run()
+        guard loginGeneration == generation else {
+            return false
+        }
+
+        switch outcome {
+        case .succeeded:
+            loginErrors.removeValue(forKey: id)
+            model.setLoggingIn(id, false)
+            didResetLoggingIn = true
+            await model.refresh(id, .afterLogin)
+            syncLoginError(for: id)
+            onStateChange?()
+            return true
+
+        case .skipped(let error):
+            if let error {
+                loginErrors[id] = error
+            }
+            model.setLoggingIn(id, false)
+            didResetLoggingIn = true
+            onStateChange?()
+            return true
+
+        case .stopped(let error):
+            if let error {
+                loginErrors[id] = error
+            }
+            model.setLoggingIn(id, false)
+            didResetLoggingIn = true
+            onStateChange?()
+            return false
+        }
+    }
+
+    private func clearResolvedLoginErrors() {
+        for view in model.clusters where view.status == .live {
+            loginErrors.removeValue(forKey: view.config.id)
+        }
+    }
+
+    private func syncLoginError(for id: UUID) {
+        if let view = model.clusters.first(where: { $0.config.id == id }), view.status == .live {
+            loginErrors.removeValue(forKey: id)
+        }
+    }
+
     private func regenerateSSHConfigIfUserConfigChanged() async {
         while let existing = activeSSHConfigTask {
             await existing.value
@@ -234,7 +490,7 @@ final class AppEnvironment: ObservableObject {
         let appTemplate = paths.socketTemplate
         let runner = self.runner
 
-        let blocks = await withTaskGroup(of: (Int, String).self) { group in
+        let resolvedResults = await withTaskGroup(of: (Int, UUID, String, String).self) { group in
             for (index, cluster) in enabledClusters.enumerated() {
                 group.addTask {
                     let resolved = await ControlPathResolver.resolve(
@@ -248,19 +504,22 @@ final class AppEnvironment: ObservableObject {
                         sshG: resolved.sshG,
                         controlPath: resolved.controlPath
                     )
-                    return (index, block)
+                    return (index, cluster.id, block, resolved.controlPath)
                 }
             }
 
-            var ordered = Array(repeating: "", count: enabledClusters.count)
-            for await (index, block) in group {
-                ordered[index] = block
+            var orderedBlocks = Array(repeating: "", count: enabledClusters.count)
+            var pathsByID: [UUID: String] = [:]
+            for await (index, id, block, controlPath) in group {
+                orderedBlocks[index] = block
+                pathsByID[id] = controlPath
             }
-            return ordered
+            return (orderedBlocks, pathsByID)
         }
 
         do {
-            try GeneratedSSHConfig.write(blocks: blocks, to: paths.sshConfig)
+            try GeneratedSSHConfig.write(blocks: resolvedResults.0, to: paths.sshConfig)
+            resolvedControlPaths = resolvedResults.1
             lastUserSSHConfigMTime = mtime
             hasGeneratedSSHConfig = true
         } catch {

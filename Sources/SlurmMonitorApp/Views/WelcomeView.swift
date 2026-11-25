@@ -1,0 +1,811 @@
+import AppKit
+import SlurmMonitorCore
+import SwiftUI
+
+/// Onboarding and incremental add-cluster flow supporting Alliance presets, SSH config import, custom hosts, and SSH key setup.
+struct WelcomeView: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @Environment(\.openURL) private var openURL
+
+    let isSheet: Bool
+
+    @State private var mode: WelcomeMode = .alliance
+    @State private var allianceUsername = ""
+    @State private var selectedPresets: Set<String> = Set(AlliancePresets.all.map(\.name))
+
+    @State private var importedHosts: [SSHConfigHost] = []
+    @State private var selectedImportAliases: Set<String> = []
+    @State private var importDefaultUsername = ""
+
+    @State private var customName = ""
+    @State private var customHost = ""
+    @State private var customUsername = ""
+    @State private var customSSHAlias = ""
+    @State private var customIdentityFile = ""
+    @State private var customRequiresKey = false
+
+    @State private var keyStatus: KeyStatus = .checking
+    @State private var keyPassphrase = ""
+    @State private var isGeneratingKey = false
+    @State private var keyError: String?
+    @State private var generatedKeyDisplayPath: String?
+    @State private var generatedPublicKey: String?
+    @State private var customGeneratedIdentityFile: String?
+    @State private var didCopyPublicKey = false
+
+    @State private var isSaving = false
+    @State private var saveError: String?
+
+    private static let ccdbKeysURL = URL(string: "https://ccdb.alliancecan.ca/ssh_authorized_keys")!
+
+    private let presetColumns = [
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            header
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    modeContent
+                    keySetupCard
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(maxHeight: isSheet ? 380 : 350)
+
+            if let saveError {
+                Text(saveError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            actionFooter
+        }
+        .padding(isSheet ? 16 : 0)
+        .frame(width: isSheet ? 410 : nil)
+        .task {
+            await loadInitialState()
+        }
+        .onDisappear {
+            keyPassphrase = ""
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add your clusters")
+                .font(.headline)
+
+            Picker("Setup mode", selection: $mode) {
+                ForEach(availableModes) { item in
+                    Text(item.segmentTitle)
+                        .tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .labelsHidden()
+        }
+    }
+
+    @ViewBuilder
+    private var modeContent: some View {
+        switch mode {
+        case .alliance:
+            allianceModeCard
+        case .importSSH:
+            importModeCard
+        case .custom:
+            customModeCard
+        }
+    }
+
+    private var allianceModeCard: some View {
+        let existing = env.model.clusters.map(\.config)
+        let unaddedCount = AlliancePresets.all.filter { !isPresetAlreadyAdded($0, in: existing) }.count
+
+        return Card("Alliance clusters") {
+            VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Alliance username")
+                        .font(.caption.weight(.medium))
+                    TextField("Cluster username (not email or CCRI)", text: $allianceUsername)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                HStack {
+                    Text("Clusters")
+                        .font(.caption.weight(.medium))
+                    Spacer()
+                    if unaddedCount > 0 {
+                        Button(allAvailablePresetsSelected(existing: existing) ? "Clear" : "Select all") {
+                            toggleAllAvailablePresets(existing: existing)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                    }
+                }
+
+                LazyVGrid(columns: presetColumns, alignment: .leading, spacing: 6) {
+                    ForEach(AlliancePresets.all, id: \.name) { preset in
+                        let alreadyAdded = isPresetAlreadyAdded(preset, in: existing)
+                        Toggle(isOn: presetBinding(for: preset.name, disabled: alreadyAdded)) {
+                            HStack(spacing: 4) {
+                                Text(preset.name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                if alreadyAdded {
+                                    badgeText("added")
+                                } else if preset.requiresKey {
+                                    badgeText("key")
+                                }
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .disabled(alreadyAdded)
+                    }
+                }
+
+                if unaddedCount == 0 {
+                    Text("All built-in Alliance presets are already added. Switch to Custom host or Import SSH config to add another.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var importModeCard: some View {
+        let existing = env.model.clusters.map(\.config)
+        let needsFallbackUser = importedHosts.contains { host in
+            selectedImportAliases.contains(host.alias)
+                && !isHostAlreadyAdded(host, in: existing)
+                && (host.user?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        }
+
+        return Card("Import from ~/.ssh/config") {
+            VStack(alignment: .leading, spacing: 8) {
+                if importedHosts.contains(where: { $0.user?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true }) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Default username (for entries without User)")
+                            .font(.caption.weight(.medium))
+                        TextField("Username", text: $importDefaultUsername)
+                            .textFieldStyle(.roundedBorder)
+                        if needsFallbackUser && importDefaultUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("Enter a default username for selected hosts missing a User line.")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(importedHosts, id: \.alias) { host in
+                        let alreadyAdded = isHostAlreadyAdded(host, in: existing)
+                        Toggle(isOn: importBinding(for: host.alias, disabled: alreadyAdded)) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack(spacing: 4) {
+                                    Text(host.alias)
+                                        .font(.caption.weight(.medium))
+                                    if alreadyAdded {
+                                        badgeText("added")
+                                    } else if SSHConfigImporter.isKnownClusterDomain(host.hostName ?? host.alias) {
+                                        badgeText("Alliance")
+                                    }
+                                }
+                                Text(importSubtitle(for: host))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .disabled(alreadyAdded)
+                    }
+                }
+            }
+        }
+    }
+
+    private var customModeCard: some View {
+        let collisionMessage = customCollisionMessage
+
+        return Card("Custom host") {
+            VStack(alignment: .leading, spacing: 8) {
+                labeledField("Cluster name", placeholder: "e.g. my-cluster", text: $customName)
+                labeledField("Host", placeholder: "e.g. login.example.edu", text: $customHost)
+                labeledField("Username", placeholder: "SSH username", text: $customUsername)
+                labeledField("SSH alias (optional)", placeholder: "Alias from ~/.ssh/config", text: $customSSHAlias)
+                labeledField("Identity file (optional)", placeholder: "e.g. ~/.ssh/id_ed25519", text: $customIdentityFile)
+                Toggle("Requires SSH key", isOn: $customRequiresKey)
+                    .font(.caption)
+
+                if let collisionMessage {
+                    Text(collisionMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var keySetupCard: some View {
+        Card("SSH key") {
+            VStack(alignment: .leading, spacing: 8) {
+                switch keyStatus {
+                case .checking:
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("Checking ~/.ssh and ssh-agent…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                case .foundFile(let displayPath):
+                    Label("✓ found \(displayPath)", systemImage: "key.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+
+                    if let generatedPublicKey {
+                        generatedKeyDetails(publicKey: generatedPublicKey)
+                    }
+
+                case .agentHasKeys:
+                    Label("✓ agent has keys", systemImage: "key.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+
+                case .missing:
+                    Text("No SSH key pair was found in ~/.ssh or ssh-agent. You can create one now (required for Trillium) or skip and add one later.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    SecureField("Passphrase (optional)", text: $keyPassphrase)
+                        .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Button {
+                            createKey()
+                        } label: {
+                            if isGeneratingKey {
+                                HStack(spacing: 6) {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                    Text("Creating key…")
+                                }
+                            } else {
+                                Text("Create a key for me")
+                            }
+                        }
+                        .controlSize(.small)
+                        .disabled(isGeneratingKey)
+
+                        Spacer()
+
+                        Button("Open CCDB SSH keys page") {
+                            openURL(Self.ccdbKeysURL)
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                    }
+
+                    if let keyError {
+                        Text(keyError)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func generatedKeyDetails(publicKey: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let generatedKeyDisplayPath {
+                Text("Public key (\(generatedKeyDisplayPath).pub):")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(publicKey)
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                )
+
+            HStack(spacing: 8) {
+                Button(didCopyPublicKey ? "Copied" : "Copy") {
+                    copyToPasteboard(publicKey)
+                    didCopyPublicKey = true
+                }
+                .controlSize(.small)
+
+                Button("Open CCDB SSH keys page") {
+                    openURL(Self.ccdbKeysURL)
+                }
+                .controlSize(.small)
+
+                Spacer()
+            }
+
+            Text("New keys can take a while to reach clusters")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var actionFooter: some View {
+        HStack(spacing: 8) {
+            if isSheet {
+                Button("Cancel") {
+                    keyPassphrase = ""
+                    env.isAddingCluster = false
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isSaving)
+            }
+
+            Spacer()
+
+            Button("Save without logging in") {
+                saveAndComplete(startLogin: false)
+            }
+            .controlSize(.small)
+            .disabled(!canSubmit || isSaving)
+
+            Button {
+                saveAndComplete(startLogin: true)
+            } label: {
+                if isSaving {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("Saving…")
+                    }
+                } else {
+                    Text("Log in to all")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSubmit || isSaving)
+        }
+    }
+
+    private var availableModes: [WelcomeMode] {
+        if importedHosts.isEmpty {
+            return [.alliance, .custom]
+        }
+        return WelcomeMode.allCases
+    }
+
+    private func labeledField(_ title: String, placeholder: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func badgeText(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(Color.primary.opacity(0.07))
+            )
+    }
+
+    private func importSubtitle(for host: SSHConfigHost) -> String {
+        let hostPart = host.hostName ?? host.alias
+        if let user = host.user, !user.isEmpty {
+            return "\(user)@\(hostPart)"
+        }
+        return hostPart
+    }
+
+    private func presetBinding(for name: String, disabled: Bool) -> Binding<Bool> {
+        Binding(
+            get: { !disabled && selectedPresets.contains(name) },
+            set: { isOn in
+                guard !disabled else { return }
+                if isOn {
+                    selectedPresets.insert(name)
+                } else {
+                    selectedPresets.remove(name)
+                }
+            }
+        )
+    }
+
+    private func importBinding(for alias: String, disabled: Bool) -> Binding<Bool> {
+        Binding(
+            get: { !disabled && selectedImportAliases.contains(alias) },
+            set: { isOn in
+                guard !disabled else { return }
+                if isOn {
+                    selectedImportAliases.insert(alias)
+                } else {
+                    selectedImportAliases.remove(alias)
+                }
+            }
+        )
+    }
+
+    private func allAvailablePresetsSelected(existing: [ClusterConfig]) -> Bool {
+        let available = AlliancePresets.all.filter { !isPresetAlreadyAdded($0, in: existing) }.map(\.name)
+        return !available.isEmpty && available.allSatisfy { selectedPresets.contains($0) }
+    }
+
+    private func toggleAllAvailablePresets(existing: [ClusterConfig]) {
+        let available = AlliancePresets.all.filter { !isPresetAlreadyAdded($0, in: existing) }.map(\.name)
+        if allAvailablePresetsSelected(existing: existing) {
+            selectedPresets.subtract(available)
+        } else {
+            selectedPresets.formUnion(available)
+        }
+    }
+
+    private var customCollisionMessage: String? {
+        let existing = env.model.clusters.map(\.config)
+        let trimmedName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedHost = customHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUser = customUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAlias = customSSHAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedName.isEmpty || (!trimmedHost.isEmpty && !trimmedUser.isEmpty) else {
+            return nil
+        }
+
+        let probe = ClusterConfig(
+            name: trimmedName,
+            host: trimmedHost,
+            username: trimmedUser,
+            sshAlias: trimmedAlias.isEmpty ? nil : trimmedAlias
+        )
+        if Self.isDuplicate(probe, in: existing) {
+            return "A matching cluster is already configured."
+        }
+        return nil
+    }
+
+    private var canSubmit: Bool {
+        let existing = env.model.clusters.map(\.config)
+        switch mode {
+        case .alliance:
+            let user = allianceUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !user.isEmpty else { return false }
+            let newCandidates = buildCandidateClusters()
+            return !Self.merge(existing: existing, adding: newCandidates).addedIDs.isEmpty
+
+        case .importSSH:
+            let selected = importedHosts.filter {
+                selectedImportAliases.contains($0.alias) && !isHostAlreadyAdded($0, in: existing)
+            }
+            guard !selected.isEmpty else { return false }
+            let fallbackUser = importDefaultUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            let missingRequiredUser = selected.contains {
+                ($0.user?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) && fallbackUser.isEmpty
+            }
+            guard !missingRequiredUser else { return false }
+            return !Self.merge(existing: existing, adding: buildCandidateClusters()).addedIDs.isEmpty
+
+        case .custom:
+            let trimmedName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedHost = customHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedUser = customUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedName.isEmpty, !trimmedHost.isEmpty, !trimmedUser.isEmpty else {
+                return false
+            }
+            return customCollisionMessage == nil
+        }
+    }
+
+    private func loadInitialState() async {
+        let existing = env.model.clusters.map(\.config)
+        if let existingUser = existing.first(where: { !$0.username.isEmpty })?.username {
+            if allianceUsername.isEmpty {
+                allianceUsername = existingUser
+            }
+            if importDefaultUsername.isEmpty {
+                importDefaultUsername = existingUser
+            }
+        }
+
+        selectedPresets = Set(
+            AlliancePresets.all
+                .filter { !isPresetAlreadyAdded($0, in: existing) }
+                .map(\.name)
+        )
+
+        let userConfigText = (try? String(contentsOf: env.paths.userSSHConfig, encoding: .utf8)) ?? ""
+        let parsedHosts = SSHConfigImporter.parseHosts(userConfigText)
+        importedHosts = parsedHosts
+        selectedImportAliases = Set(
+            parsedHosts
+                .filter {
+                    !isHostAlreadyAdded($0, in: existing)
+                        && SSHConfigImporter.isKnownClusterDomain($0.hostName ?? $0.alias)
+                }
+                .map(\.alias)
+        )
+        if importedHosts.isEmpty && mode == .importSSH {
+            mode = .alliance
+        }
+
+        await refreshKeyStatus()
+    }
+
+    private func refreshKeyStatus() async {
+        keyStatus = .checking
+        let sshDir = env.paths.sshDirectory
+        let existing = KeyManager.existingKeys(sshDir: sshDir)
+        if let first = existing.first {
+            keyStatus = .foundFile(displayPath(for: first))
+            return
+        }
+
+        if await KeyManager.agentHasKeys(runner: env.runner) {
+            keyStatus = .agentHasKeys
+            return
+        }
+
+        let customKeyURL = sshDir.appendingPathComponent("id_ed25519_slurm_monitor")
+        let customPubURL = URL(fileURLWithPath: customKeyURL.path + ".pub")
+        if isRegularFile(customKeyURL), isRegularFile(customPubURL),
+           let pubText = try? String(contentsOf: customPubURL, encoding: .utf8) {
+            let trimmedPub = pubText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let display = displayPath(for: customKeyURL)
+            customGeneratedIdentityFile = display
+            generatedKeyDisplayPath = display
+            generatedPublicKey = trimmedPub
+            keyStatus = .foundFile(display)
+            return
+        }
+
+        keyStatus = .missing
+    }
+
+    private func createKey() {
+        let passphrase = keyPassphrase
+        keyPassphrase = ""
+        keyError = nil
+        didCopyPublicKey = false
+        isGeneratingKey = true
+
+        let sshDir = env.paths.sshDirectory
+        let defaultPrivate = sshDir.appendingPathComponent("id_ed25519")
+        let defaultPublic = URL(fileURLWithPath: defaultPrivate.path + ".pub")
+        let useDefaultName = !FileManager.default.fileExists(atPath: defaultPrivate.path)
+            && !FileManager.default.fileExists(atPath: defaultPublic.path)
+        let targetURL = useDefaultName
+            ? defaultPrivate
+            : sshDir.appendingPathComponent("id_ed25519_slurm_monitor")
+
+        Task {
+            do {
+                let publicKey = try await KeyManager.generate(
+                    at: targetURL,
+                    passphrase: passphrase,
+                    runner: env.runner
+                )
+                let display = displayPath(for: targetURL)
+                generatedKeyDisplayPath = display
+                generatedPublicKey = publicKey
+                customGeneratedIdentityFile = useDefaultName ? nil : display
+                keyStatus = .foundFile(display)
+                isGeneratingKey = false
+            } catch {
+                keyError = error.localizedDescription
+                isGeneratingKey = false
+            }
+        }
+    }
+
+    private func saveAndComplete(startLogin: Bool) {
+        let candidates = buildCandidateClusters()
+        let existing = env.model.clusters.map(\.config)
+        let mergedResult = Self.merge(existing: existing, adding: candidates)
+        guard !mergedResult.addedIDs.isEmpty else {
+            saveError = "No new clusters selected."
+            return
+        }
+
+        isSaving = true
+        saveError = nil
+        keyPassphrase = ""
+
+        Task {
+            do {
+                try await env.saveClusters(mergedResult.merged)
+                isSaving = false
+                if isSheet {
+                    if startLogin {
+                        env.dismissAddClusterSheetAndLogin(mergedResult.addedIDs)
+                    } else {
+                        env.isAddingCluster = false
+                    }
+                } else if startLogin {
+                    env.login(mergedResult.addedIDs)
+                }
+            } catch {
+                saveError = error.localizedDescription
+                isSaving = false
+            }
+        }
+    }
+
+    private func buildCandidateClusters() -> [ClusterConfig] {
+        let existing = env.model.clusters.map(\.config)
+        let rawClusters: [ClusterConfig]
+
+        switch mode {
+        case .alliance:
+            let username = allianceUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            let availableSelected = Set(
+                AlliancePresets.all
+                    .filter { selectedPresets.contains($0.name) && !isPresetAlreadyAdded($0, in: existing) }
+                    .map(\.name)
+            )
+            rawClusters = AlliancePresets.clusters(username: username, selected: availableSelected)
+
+        case .importSSH:
+            let fallbackUser = importDefaultUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            rawClusters = importedHosts
+                .filter { selectedImportAliases.contains($0.alias) && !isHostAlreadyAdded($0, in: existing) }
+                .map { SSHConfigImporter.cluster(from: $0, defaultUser: fallbackUser) }
+
+        case .custom:
+            let trimmedName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedHost = customHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedUser = customUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedAlias = customSSHAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedIdentity = customIdentityFile.trimmingCharacters(in: .whitespacesAndNewlines)
+            rawClusters = [
+                ClusterConfig(
+                    name: trimmedName,
+                    host: trimmedHost,
+                    username: trimmedUser,
+                    sshAlias: trimmedAlias.isEmpty ? nil : trimmedAlias,
+                    identityFile: trimmedIdentity.isEmpty ? nil : trimmedIdentity,
+                    requiresKey: customRequiresKey
+                ),
+            ]
+        }
+
+        guard let customIdentity = customGeneratedIdentityFile else {
+            return rawClusters
+        }
+        return rawClusters.map { cluster in
+            var copy = cluster
+            if copy.identityFile?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+                copy.identityFile = customIdentity
+            }
+            return copy
+        }
+    }
+
+    private func isPresetAlreadyAdded(_ preset: PresetCluster, in existing: [ClusterConfig]) -> Bool {
+        existing.contains {
+            $0.name.caseInsensitiveCompare(preset.name) == .orderedSame
+                || $0.host.caseInsensitiveCompare(preset.host) == .orderedSame
+        }
+    }
+
+    private func isHostAlreadyAdded(_ host: SSHConfigHost, in existing: [ClusterConfig]) -> Bool {
+        let resolvedHost = host.hostName ?? host.alias
+        return existing.contains { cluster in
+            if cluster.name.caseInsensitiveCompare(host.alias) == .orderedSame
+                || (cluster.sshAlias?.caseInsensitiveCompare(host.alias) == .orderedSame) {
+                return true
+            }
+            guard cluster.host.caseInsensitiveCompare(resolvedHost) == .orderedSame else {
+                return false
+            }
+            if let hostUser = host.user?.trimmingCharacters(in: .whitespacesAndNewlines), !hostUser.isEmpty {
+                return cluster.username.caseInsensitiveCompare(hostUser) == .orderedSame
+            }
+            return true
+        }
+    }
+
+    private func displayPath(for url: URL) -> String {
+        let homeSSH = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ssh", isDirectory: true)
+            .standardizedFileURL.path
+        let parent = url.deletingLastPathComponent().standardizedFileURL.path
+        if parent == homeSSH {
+            return "~/.ssh/\(url.lastPathComponent)"
+        }
+        return url.path
+    }
+
+    private func isRegularFile(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private static func isDuplicate(_ candidate: ClusterConfig, in existing: [ClusterConfig]) -> Bool {
+        let candidateAlias = candidate.generatedAlias.lowercased()
+        let candidateTarget = connectionIdentity(for: candidate)
+        return existing.contains { item in
+            item.generatedAlias.lowercased() == candidateAlias
+                || connectionIdentity(for: item) == candidateTarget
+        }
+    }
+
+    private static func merge(
+        existing: [ClusterConfig],
+        adding candidates: [ClusterConfig]
+    ) -> (merged: [ClusterConfig], addedIDs: [UUID]) {
+        var merged = existing
+        var addedIDs: [UUID] = []
+
+        for candidate in candidates {
+            guard !isDuplicate(candidate, in: merged) else { continue }
+            merged.append(candidate)
+            addedIDs.append(candidate.id)
+        }
+
+        return (merged, addedIDs)
+    }
+
+    private static func connectionIdentity(for cluster: ClusterConfig) -> String {
+        let host = cluster.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let user = cluster.username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let alias = (cluster.sshAlias ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(user)@\(host)#\(alias)"
+    }
+}
+
+private enum WelcomeMode: String, CaseIterable, Identifiable {
+    case alliance
+    case importSSH
+    case custom
+
+    var id: Self { self }
+
+    var segmentTitle: String {
+        switch self {
+        case .alliance:
+            return "Alliance clusters"
+        case .importSSH:
+            return "Import SSH config"
+        case .custom:
+            return "Custom host"
+        }
+    }
+}
+
+private enum KeyStatus: Equatable {
+    case checking
+    case foundFile(String)
+    case agentHasKeys
+    case missing
+}

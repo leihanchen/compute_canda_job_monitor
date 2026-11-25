@@ -1,14 +1,19 @@
+import AppKit
 import SlurmMonitorCore
 import SwiftUI
 
 /// Clusters management tab displaying connection state, errors, methods, and edit/remove/login actions.
 struct ClustersTab: View {
     @EnvironmentObject private var env: AppEnvironment
+    @Environment(\.openURL) private var openURL
 
     let now: Date
 
     @State private var editingCluster: ClusterConfig?
     @State private var actionError: String?
+
+    private static let ccdbKeysURL = URL(string: "https://ccdb.alliancecan.ca/ssh_authorized_keys")!
+    private static let ccdbPortalURL = URL(string: "https://ccdb.alliancecan.ca/")!
 
     var body: some View {
         let staleIDs = env.staleOrErrorEnabledClusterIDs
@@ -45,6 +50,7 @@ struct ClustersTab: View {
             EditClusterSheet(cluster: cluster) { updated in
                 try await applyEdit(updated)
             }
+            .environmentObject(env)
         }
     }
 
@@ -79,6 +85,21 @@ struct ClustersTab: View {
                     Label(activeError.hint, systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
+
+                    if view.config.requiresKey, activeError == .needsSSHKey || activeError == .noAccess {
+                        HStack(spacing: 8) {
+                            Text("Trillium also requires access to be requested in CCDB")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 4)
+                            Button("Open CCDB") {
+                                let url = activeError == .needsSSHKey ? Self.ccdbKeysURL : Self.ccdbPortalURL
+                                openURL(url)
+                            }
+                            .controlSize(.mini)
+                        }
+                    }
                 }
 
                 HStack(spacing: 6) {
@@ -128,6 +149,10 @@ struct ClustersTab: View {
     }
 
     private func resolvedError(for view: ClusterView) -> ClusterError? {
+        guard view.status != .live else { return nil }
+        if let loginError = env.loginErrors[view.config.id] {
+            return loginError
+        }
         if let recorded = env.model.lastError[view.config.id] {
             return recorded
         }
@@ -173,6 +198,7 @@ struct ClustersTab: View {
 
 private struct EditClusterSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var env: AppEnvironment
 
     private let original: ClusterConfig
     private let onSave: (ClusterConfig) async throws -> Void
@@ -183,6 +209,9 @@ private struct EditClusterSheet: View {
     @State private var sshAlias: String
     @State private var identityFile: String
     @State private var enabled: Bool
+    @State private var resolvedControlPath = ""
+    @State private var socketFromUserConfig = false
+    @State private var didCopySnippet = false
     @State private var isSaving = false
     @State private var saveError: String?
 
@@ -215,6 +244,8 @@ private struct EditClusterSheet: View {
             }
             .formStyle(.grouped)
 
+            snippetCard
+
             if let saveError {
                 Text(saveError)
                     .font(.caption)
@@ -236,7 +267,85 @@ private struct EditClusterSheet: View {
             }
         }
         .padding(16)
-        .frame(width: 340)
+        .frame(width: 400)
+        .onAppear {
+            if resolvedControlPath.isEmpty {
+                resolvedControlPath = env.immediateControlPath(for: draftCluster)
+            }
+        }
+        .task(id: snippetResolutionKey) {
+            didCopySnippet = false
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            let info = await env.resolvedControlPathInfo(for: draftCluster)
+            guard !Task.isCancelled else { return }
+            resolvedControlPath = info.controlPath
+            socketFromUserConfig = info.fromUserConfig
+        }
+    }
+
+    private var snippetCard: some View {
+        let controlPath = resolvedControlPath.isEmpty
+            ? env.immediateControlPath(for: draftCluster)
+            : resolvedControlPath
+        let snippet = env.sshReuseSnippet(for: draftCluster, controlPath: controlPath)
+
+        return Card("Terminal SSH reuse snippet") {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(
+                    socketFromUserConfig
+                        ? "Matches the ControlPath already configured in ~/.ssh/config."
+                        : "Optional ~/.ssh/config block so Terminal shares this connection. The app never writes ~/.ssh/config."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Text(snippet)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    )
+
+                HStack {
+                    Spacer()
+                    Button(didCopySnippet ? "Copied" : "Copy snippet") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(snippet, forType: .string)
+                        didCopySnippet = true
+                    }
+                    .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private var snippetResolutionKey: String {
+        "\(name)|\(host)|\(username)|\(sshAlias)"
+    }
+
+    private var draftCluster: ClusterConfig {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUser = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAlias = sshAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedIdentity = identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return ClusterConfig(
+            id: original.id,
+            name: trimmedName.isEmpty ? original.name : trimmedName,
+            host: trimmedHost.isEmpty ? original.host : trimmedHost,
+            username: trimmedUser.isEmpty ? original.username : trimmedUser,
+            sshAlias: trimmedAlias.isEmpty ? nil : trimmedAlias,
+            identityFile: trimmedIdentity.isEmpty ? nil : trimmedIdentity,
+            enabled: enabled,
+            methods: original.methods,
+            requiresKey: original.requiresKey
+        )
     }
 
     private var isValid: Bool {
@@ -246,23 +355,7 @@ private struct EditClusterSheet: View {
     }
 
     private func saveChanges() {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedUser = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedAlias = sshAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedIdentity = identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let updated = ClusterConfig(
-            id: original.id,
-            name: trimmedName,
-            host: trimmedHost,
-            username: trimmedUser,
-            sshAlias: trimmedAlias.isEmpty ? nil : trimmedAlias,
-            identityFile: trimmedIdentity.isEmpty ? nil : trimmedIdentity,
-            enabled: enabled,
-            methods: original.methods,
-            requiresKey: original.requiresKey
-        )
+        let updated = draftCluster
 
         isSaving = true
         saveError = nil
