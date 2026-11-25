@@ -722,3 +722,54 @@ private actor AsyncGate {
     #expect(model.clusters[0].status == .live)
     #expect(model.clusters[0].methodInUse == .sharedSSH)
 }
+
+@MainActor
+@Test func noQueryWhileLoggingIn() async throws {
+    let dir = makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let store = ClusterStore(fileURL: dir.appendingPathComponent("clusters.json"))
+    let cache = SnapshotCache(directory: dir.appendingPathComponent("cache"))
+
+    let nibi = makeCluster(name: "nibi")
+    let cachedSnap = ClusterSnapshot(
+        clusterID: nibi.id,
+        fetchedAt: now.addingTimeInterval(-300),
+        active: [makeActiveJob(id: "42", state: .running, gpus: 2)],
+        ended: []
+    )
+    try cache.save(cachedSnap)
+    try store.save([nibi])
+
+    let fake = FakeTransport(
+        kind: .sharedSSH,
+        probeResult: .usable,
+        runResult: .success(cannedSlurmOutput)
+    )
+
+    let model = MonitorModel(
+        store: store,
+        cache: cache,
+        transports: { _ in [fake] },
+        now: { now }
+    )
+
+    let previousStatus = model.clusters[0].status
+    #expect(previousStatus == .stale)
+
+    model.setLoggingIn(nibi.id, true)
+    #expect(model.clusters[0].status == .loggingIn)
+
+    for reason in [RefreshReason.background, .manual, .wakeOrNetwork] {
+        await model.refreshAll(reason)
+        #expect(fake.probeCount == 0)
+        #expect(fake.runCount == 0)
+        #expect(model.clusters[0].status == .loggingIn)
+    }
+
+    model.setLoggingIn(nibi.id, false)
+    #expect(model.clusters[0].status == previousStatus)
+    #expect(fake.probeCount == 0)
+    #expect(fake.runCount == 0)
+}
