@@ -1,6 +1,46 @@
+import AppKit
 import Combine
 import Foundation
+import os
 import SlurmMonitorCore
+
+private struct SendableNotificationToken: @unchecked Sendable {
+    let value: NSObjectProtocol
+}
+
+private final class NotificationObserverToken: @unchecked Sendable {
+    private let center: NotificationCenter
+    private let tokenLock: OSAllocatedUnfairLock<SendableNotificationToken?>
+
+    init(
+        center: NotificationCenter = .default,
+        name: Notification.Name,
+        handler: @escaping @Sendable () -> Void
+    ) {
+        self.center = center
+        let token = SendableNotificationToken(
+            value: center.addObserver(forName: name, object: nil, queue: nil) { _ in
+                handler()
+            }
+        )
+        self.tokenLock = OSAllocatedUnfairLock(initialState: token)
+    }
+
+    deinit {
+        invalidate()
+    }
+
+    func invalidate() {
+        let token = tokenLock.withLock { current -> SendableNotificationToken? in
+            let existing = current
+            current = nil
+            return existing
+        }
+        if let token {
+            center.removeObserver(token.value)
+        }
+    }
+}
 
 /// Standard filesystem locations used by Slurm Monitor under `~/.slurm-monitor`.
 struct AppPaths: Sendable {
@@ -48,7 +88,7 @@ final class AppEnvironment: ObservableObject {
                 startTimers()
             }
             if settings.stayAwakeWhilePluggedIn != oldValue.stayAwakeWhilePluggedIn {
-                onStateChange?()
+                notifyStateChanged()
             }
         }
     }
@@ -66,8 +106,11 @@ final class AppEnvironment: ObservableObject {
 
     private let userDefaults: UserDefaults
     private let loginExecutable: String
+    private let stayAwake: StayAwakeController
+    private let systemEventsLock = OSAllocatedUnfairLock<SystemEventsMonitor?>(initialState: nil)
+    private let timerTaskLock = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+    private let terminationObserver: NotificationObserverToken
     private var cancellables: Set<AnyCancellable> = []
-    private var timerTask: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
     private var loginGeneration: UInt64 = 0
     private var activeSSHConfigTask: Task<Void, Never>?
@@ -104,6 +147,22 @@ final class AppEnvironment: ObservableObject {
             transports: Self.makeTransportFactory(paths: paths, runner: runner)
         )
 
+        let stayAwake = StayAwakeController(observePowerSource: false)
+        self.stayAwake = stayAwake
+
+        let systemEventsBox = self.systemEventsLock
+        self.terminationObserver = NotificationObserverToken(
+            name: NSApplication.willTerminateNotification
+        ) { [weak stayAwake] in
+            stayAwake?.release()
+            let monitor = systemEventsBox.withLock { current -> SystemEventsMonitor? in
+                let existing = current
+                current = nil
+                return existing
+            }
+            monitor?.stop()
+        }
+
         self.model.objectWillChange
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
@@ -115,10 +174,40 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
-    /// Runs initial SSH config generation, background check-in, and starts the periodic refresh timer.
+    deinit {
+        let timerTask = timerTaskLock.withLock { current -> Task<Void, Never>? in
+            let existing = current
+            current = nil
+            return existing
+        }
+        timerTask?.cancel()
+
+        let monitor = systemEventsLock.withLock { current -> SystemEventsMonitor? in
+            let existing = current
+            current = nil
+            return existing
+        }
+        monitor?.stop()
+    }
+
+    /// Runs initial SSH config generation, background check-in, and starts the periodic refresh timer and platform monitors.
     func bootstrap() {
         guard !didBootstrap else { return }
         didBootstrap = true
+        stayAwake.startObservingPowerSource()
+
+        let monitor = SystemEventsMonitor(autoStart: true) { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.refreshAll(.wakeOrNetwork)
+            }
+        }
+        let previousMonitor = systemEventsLock.withLock { current -> SystemEventsMonitor? in
+            let old = current
+            current = monitor
+            return old
+        }
+        previousMonitor?.stop()
+
         startTimers()
         Task { [weak self] in
             guard let self else { return }
@@ -153,15 +242,20 @@ final class AppEnvironment: ObservableObject {
 
     /// Starts (or restarts) the periodic background refresh and §5.4a keep-alive check-in timer.
     func startTimers() {
-        timerTask?.cancel()
         let intervalMinutes = Self.clampedIntervalMinutes(settings.refreshIntervalMinutes)
-        timerTask = Task { [weak self] in
+        let nextTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(intervalMinutes * 60))
                 guard !Task.isCancelled, let self else { break }
                 await self.refreshAll(.background)
             }
         }
+        let previousTask = timerTaskLock.withLock { current -> Task<Void, Never>? in
+            let old = current
+            current = nextTask
+            return old
+        }
+        previousTask?.cancel()
     }
 
     /// Regenerates SSH config if `~/.ssh/config` changed on disk, then refreshes monitored clusters.
@@ -171,7 +265,7 @@ final class AppEnvironment: ObservableObject {
         defer {
             activeRefreshCount = max(0, activeRefreshCount - 1)
             isRefreshing = activeRefreshCount > 0
-            onStateChange?()
+            notifyStateChanged()
         }
 
         await regenerateSSHConfigIfUserConfigChanged()
@@ -193,7 +287,7 @@ final class AppEnvironment: ObservableObject {
             await model.refresh(refreshTargetID, .manual)
             syncLoginError(for: refreshTargetID)
         }
-        onStateChange?()
+        notifyStateChanged()
     }
 
     /// Walks `ids` sequentially, probing existing shared connections and presenting `LoginSheet` only when login is required.
@@ -242,7 +336,7 @@ final class AppEnvironment: ObservableObject {
         for view in model.clusters where view.status == .loggingIn {
             model.setLoggingIn(view.config.id, false)
         }
-        onStateChange?()
+        notifyStateChanged()
     }
 
     /// Returns a cached or expanded default socket path immediately for display before async `ssh -G` resolution completes.
@@ -335,7 +429,7 @@ final class AppEnvironment: ObservableObject {
                 loginTask = nil
                 activeLoginState = nil
                 loginQueue = []
-                onStateChange?()
+                notifyStateChanged()
             }
         }
 
@@ -447,7 +541,7 @@ final class AppEnvironment: ObservableObject {
             }
             model.setLoggingIn(id, false)
             didResetLoggingIn = true
-            onStateChange?()
+            notifyStateChanged()
             return true
 
         case .stopped(let error):
@@ -456,19 +550,27 @@ final class AppEnvironment: ObservableObject {
             }
             model.setLoggingIn(id, false)
             didResetLoggingIn = true
-            onStateChange?()
+            notifyStateChanged()
             return false
         }
     }
 
     private func triggerAfterLoginRefresh(for id: UUID) {
-        onStateChange?()
+        notifyStateChanged()
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.model.refresh(id, .afterLogin)
             self.syncLoginError(for: id)
-            self.onStateChange?()
+            self.notifyStateChanged()
         }
+    }
+
+    private func notifyStateChanged() {
+        stayAwake.update(
+            enabled: settings.stayAwakeWhilePluggedIn,
+            liveConnections: model.liveCount()
+        )
+        onStateChange?()
     }
 
     private func clearResolvedLoginErrors() {
