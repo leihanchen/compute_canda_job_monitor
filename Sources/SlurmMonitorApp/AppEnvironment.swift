@@ -392,11 +392,13 @@ final class AppEnvironment: ObservableObject {
 
         if await transport.probe() == .usable {
             guard !Task.isCancelled, loginGeneration == generation else { return false }
+            loginErrors.removeValue(forKey: id)
             model.setLoggingIn(id, false)
             didResetLoggingIn = true
-            await model.refresh(id, .afterLogin)
-            syncLoginError(for: id)
-            onStateChange?()
+            if position == total {
+                activeLoginState = nil
+            }
+            triggerAfterLoginRefresh(for: id)
             return true
         }
 
@@ -433,9 +435,10 @@ final class AppEnvironment: ObservableObject {
             loginErrors.removeValue(forKey: id)
             model.setLoggingIn(id, false)
             didResetLoggingIn = true
-            await model.refresh(id, .afterLogin)
-            syncLoginError(for: id)
-            onStateChange?()
+            if position == total {
+                activeLoginState = nil
+            }
+            triggerAfterLoginRefresh(for: id)
             return true
 
         case .skipped(let error):
@@ -455,6 +458,16 @@ final class AppEnvironment: ObservableObject {
             didResetLoggingIn = true
             onStateChange?()
             return false
+        }
+    }
+
+    private func triggerAfterLoginRefresh(for id: UUID) {
+        onStateChange?()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.model.refresh(id, .afterLogin)
+            self.syncLoginError(for: id)
+            self.onStateChange?()
         }
     }
 

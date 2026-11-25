@@ -22,6 +22,7 @@ final class LoginSessionController: ObservableObject {
         case connecting
         case prompt(LoginPrompt)
         case waiting(String)
+        case succeeded
         case failed(ClusterError, detail: String?)
     }
 
@@ -166,6 +167,7 @@ final class LoginSessionController: ObservableObject {
 
         case .succeeded:
             isFinished = true
+            phase = .succeeded
             resolve(.succeeded)
 
         case .failed(let err):
@@ -348,6 +350,17 @@ private struct LoginSessionBody: View {
 
         case .waiting(let message):
             waitingCard(message)
+
+        case .succeeded:
+            Card {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Connected")
+                        .font(.caption.weight(.medium))
+                }
+                .padding(.vertical, 2)
+            }
 
         case .prompt(let prompt):
             switch prompt {
