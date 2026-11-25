@@ -18,7 +18,13 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "SlurmMonitorCore"
+            name: "CPTYHelper",
+            path: "Sources/CPTYHelper",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "SlurmMonitorCore",
+            dependencies: ["CPTYHelper"]
         ),
         .executableTarget(
             name: "SlurmMonitorApp",
