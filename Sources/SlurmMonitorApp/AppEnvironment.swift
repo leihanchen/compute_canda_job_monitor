@@ -63,6 +63,8 @@ final class AppEnvironment: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var timerTask: Task<Void, Never>?
     private var activeSSHConfigTask: Task<Void, Never>?
+    private var requestedSSHConfigGeneration: UInt64 = 0
+    private var attemptedSSHConfigGeneration: UInt64 = 0
     private var hasGeneratedSSHConfig = false
     private var lastUserSSHConfigMTime: Date?
     private var activeRefreshCount = 0
@@ -115,18 +117,25 @@ final class AppEnvironment: ObservableObject {
 
     /// Reads `~/.ssh/config` safely, resolves `ControlPath` per enabled cluster, and writes `~/.slurm-monitor/ssh_config`.
     func regenerateSSHConfig() async {
-        while let existing = activeSSHConfigTask {
-            await existing.value
-        }
+        requestedSSHConfigGeneration &+= 1
+        let targetGeneration = requestedSSHConfigGeneration
 
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.performRegenerateSSHConfig()
-        }
-        activeSSHConfigTask = task
-        await task.value
-        if activeSSHConfigTask == task {
-            activeSSHConfigTask = nil
+        while attemptedSSHConfigGeneration < targetGeneration {
+            if let existing = activeSSHConfigTask {
+                await existing.value
+            } else {
+                let runGeneration = requestedSSHConfigGeneration
+                let task = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    defer {
+                        self.activeSSHConfigTask = nil
+                        self.attemptedSSHConfigGeneration = max(self.attemptedSSHConfigGeneration, runGeneration)
+                    }
+                    await self.performRegenerateSSHConfig()
+                }
+                activeSSHConfigTask = task
+                await task.value
+            }
         }
     }
 
@@ -206,8 +215,13 @@ final class AppEnvironment: ObservableObject {
     }
 
     private func regenerateSSHConfigIfUserConfigChanged() async {
+        while let existing = activeSSHConfigTask {
+            await existing.value
+        }
         let currentMTime = Self.modificationDate(of: paths.userSSHConfig)
-        if !hasGeneratedSSHConfig || currentMTime != lastUserSSHConfigMTime {
+        if !hasGeneratedSSHConfig
+            || currentMTime != lastUserSSHConfigMTime
+            || attemptedSSHConfigGeneration < requestedSSHConfigGeneration {
             await regenerateSSHConfig()
         }
     }
@@ -215,8 +229,6 @@ final class AppEnvironment: ObservableObject {
     private func performRegenerateSSHConfig() async {
         let mtime = Self.modificationDate(of: paths.userSSHConfig)
         let userConfigText = (try? String(contentsOf: paths.userSSHConfig, encoding: .utf8)) ?? ""
-        lastUserSSHConfigMTime = mtime
-        hasGeneratedSSHConfig = true
 
         let enabledClusters = model.clusters.map(\.config).filter(\.enabled)
         let appTemplate = paths.socketTemplate
@@ -247,7 +259,13 @@ final class AppEnvironment: ObservableObject {
             return ordered
         }
 
-        try? GeneratedSSHConfig.write(blocks: blocks, to: paths.sshConfig)
+        do {
+            try GeneratedSSHConfig.write(blocks: blocks, to: paths.sshConfig)
+            lastUserSSHConfigMTime = mtime
+            hasGeneratedSSHConfig = true
+        } catch {
+            // Leave generation state unchanged so subsequent refresh ticks retry the write.
+        }
     }
 
     private static func makeTransportFactory(
