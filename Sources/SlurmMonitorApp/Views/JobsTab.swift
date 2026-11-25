@@ -53,7 +53,7 @@ struct JobsTab: View {
         return Card(nil, trailing: nil) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    StatusDot(status: view.status, enabled: view.config.enabled)
+                    StatusDot(status: env.effectiveStatus(for: view), enabled: view.config.enabled)
                     Text(view.config.name)
                         .font(.caption.weight(.semibold))
                     Spacer(minLength: 4)

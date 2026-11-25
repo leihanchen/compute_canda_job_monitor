@@ -192,16 +192,17 @@ struct OverviewTab: View {
     }
 
     private func clusterTile(_ view: ClusterView) -> some View {
-        HStack(spacing: 6) {
-            StatusDot(status: view.status, enabled: view.config.enabled)
+        let status = env.effectiveStatus(for: view)
+        return HStack(spacing: 6) {
+            StatusDot(status: status, enabled: view.config.enabled)
             Text(view.config.name)
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 4)
-            Text(tileDetail(for: view))
+            Text(tileDetail(for: view, effectiveStatus: status))
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(view.status == .live ? .primary : .secondary)
+                .foregroundStyle(status == .live ? .primary : .secondary)
                 .lineLimit(1)
         }
         .padding(.horizontal, 10)
@@ -252,8 +253,8 @@ struct OverviewTab: View {
         return trimmed.isEmpty ? "Pending" : trimmed
     }
 
-    private func tileDetail(for view: ClusterView) -> String {
-        switch view.status {
+    private func tileDetail(for view: ClusterView, effectiveStatus: ClusterStatus) -> String {
+        switch effectiveStatus {
         case .live:
             let active = view.snapshot?.active ?? []
             let running = active.filter { $0.state == .running || $0.state == .completing }.count

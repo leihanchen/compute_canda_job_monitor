@@ -773,3 +773,182 @@ private actor AsyncGate {
     #expect(fake.probeCount == 0)
     #expect(fake.runCount == 0)
 }
+
+@MainActor
+@Test func clusterRenameResetsStateAndBumpsEpoch() async throws {
+    let dir = makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let store = ClusterStore(fileURL: dir.appendingPathComponent("clusters.json"))
+    let cache = SnapshotCache(directory: dir.appendingPathComponent("cache"))
+
+    let nibi = ClusterConfig(
+        name: "nibi",
+        host: "nibi.alliancecan.ca",
+        username: "leihan",
+        sshAlias: "nibi-alias"
+    )
+    try store.save([nibi])
+
+    let gate = AsyncGate()
+    let transport = FakeTransport(
+        kind: .sharedSSH,
+        probeResult: .usable,
+        runHandler: { _, _ in
+            await gate.arriveAndWait()
+            return cannedSlurmOutput
+        }
+    )
+
+    // First bring cluster live with a direct non-gated run.
+    let quickSuccess = FakeTransport(kind: .sharedSSH, probeResult: .usable, runResult: .success(cannedSlurmOutput))
+    let liveModel = MonitorModel(
+        store: store,
+        cache: cache,
+        transports: { _ in [quickSuccess] },
+        now: { now }
+    )
+    await liveModel.refresh(nibi.id, .manual)
+    #expect(liveModel.clusters[0].status == .live)
+    #expect(liveModel.clusters[0].methodInUse == .sharedSSH)
+
+    // Rename changes generatedAlias -> resets methodInUse, status -> .stale, clears lastError.
+    var renamed = nibi
+    renamed.name = "nibi-renamed"
+    try liveModel.setClusters([renamed])
+    #expect(liveModel.clusters[0].methodInUse == nil)
+    #expect(liveModel.clusters[0].status == .stale)
+    #expect(liveModel.lastError[nibi.id] == nil)
+
+    // Changing requiresKey, host, or username (even when sshAlias keeps sshTarget identical) also resets state.
+    await liveModel.refresh(nibi.id, .manual)
+    #expect(liveModel.clusters[0].status == .live)
+    var updatedKeyReq = renamed
+    updatedKeyReq.requiresKey = true
+    try liveModel.setClusters([updatedKeyReq])
+    #expect(liveModel.clusters[0].methodInUse == nil)
+    #expect(liveModel.clusters[0].status == .stale)
+
+    await liveModel.refresh(nibi.id, .manual)
+    #expect(liveModel.clusters[0].status == .live)
+    var updatedUser = updatedKeyReq
+    updatedUser.username = "otheruser"
+    try liveModel.setClusters([updatedUser])
+    #expect(liveModel.clusters[0].methodInUse == nil)
+    #expect(liveModel.clusters[0].status == .stale)
+
+    // In-flight refresh started before rename must not commit after rename bumps stateEpoch.
+    let uncached = makeCluster(name: "fir")
+    try store.save([uncached])
+    let gatedModel = MonitorModel(
+        store: store,
+        cache: cache,
+        transports: { _ in [transport] },
+        now: { now }
+    )
+    let refreshTask = Task {
+        await gatedModel.refresh(uncached.id, .manual)
+    }
+    await gate.waitUntilEntered()
+
+    var renamedUncached = uncached
+    renamedUncached.name = "fir-renamed"
+    try gatedModel.setClusters([renamedUncached])
+    #expect(gatedModel.clusters[0].status == .error(.needsLogin))
+
+    await gate.release()
+    await refreshTask.value
+
+    #expect(gatedModel.clusters[0].status == .error(.needsLogin))
+    #expect(gatedModel.clusters[0].methodInUse == nil)
+    #expect(gatedModel.clusters[0].snapshot == nil)
+}
+
+@MainActor
+@Test func clusterDisableClearsLastErrorAndResetsMethodAndEpoch() async throws {
+    let dir = makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let store = ClusterStore(fileURL: dir.appendingPathComponent("clusters.json"))
+    let cache = SnapshotCache(directory: dir.appendingPathComponent("cache"))
+
+    let nibi = makeCluster(name: "nibi")
+    try store.save([nibi])
+
+    let transport = FakeTransport(kind: .sharedSSH, probeResult: .unavailable(.noAccess))
+    let model = MonitorModel(
+        store: store,
+        cache: cache,
+        transports: { _ in [transport] },
+        now: { now }
+    )
+
+    await model.refresh(nibi.id, .manual)
+    #expect(model.lastError[nibi.id] == .noAccess)
+    #expect(model.clusters[0].status == .error(.noAccess))
+
+    var disabled = nibi
+    disabled.enabled = false
+    try model.setClusters([disabled])
+    #expect(model.lastError[nibi.id] == nil)
+    #expect(model.clusters[0].methodInUse == nil)
+    #expect(model.clusters[0].status == .error(.needsLogin))
+
+    // Also verify live cluster with snapshot clears methodInUse, resets to .stale, and clears lastError on disable.
+    var reenabled = disabled
+    reenabled.enabled = true
+    transport.probeResult = .usable
+    transport.runResult = .success(cannedSlurmOutput)
+    try model.setClusters([reenabled])
+    await model.refresh(nibi.id, .manual)
+    #expect(model.clusters[0].status == .live)
+    #expect(model.clusters[0].methodInUse == .sharedSSH)
+
+    try model.setClusters([disabled])
+    #expect(model.lastError[nibi.id] == nil)
+    #expect(model.clusters[0].methodInUse == nil)
+    #expect(model.clusters[0].status == .stale)
+}
+
+@MainActor
+@Test func cancelledRefreshThrowingNonCancellationErrorDoesNotRecordFailure() async throws {
+    let dir = makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let store = ClusterStore(fileURL: dir.appendingPathComponent("clusters.json"))
+    let cache = SnapshotCache(directory: dir.appendingPathComponent("cache"))
+
+    let nibi = makeCluster(name: "nibi")
+    try store.save([nibi])
+
+    let gate = AsyncGate()
+    let transport = FakeTransport(
+        kind: .sharedSSH,
+        probeResult: .usable,
+        runHandler: { _, _ in
+            await gate.arriveAndWait()
+            throw ClusterError.slurmFailed("SIGTERM")
+        }
+    )
+
+    let model = MonitorModel(
+        store: store,
+        cache: cache,
+        transports: { _ in [transport] },
+        now: { now }
+    )
+
+    let task = Task {
+        await model.refresh(nibi.id, .manual)
+    }
+    await gate.waitUntilEntered()
+    task.cancel()
+    await gate.release()
+    await task.value
+
+    #expect(model.lastError[nibi.id] == nil)
+    #expect(model.clusters[0].status == .error(.needsLogin))
+}

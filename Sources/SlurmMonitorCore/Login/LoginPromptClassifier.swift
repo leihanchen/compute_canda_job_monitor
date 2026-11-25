@@ -56,7 +56,8 @@ public enum LoginPromptClassifier {
         guard !trimmedTail.isEmpty else { return nil }
 
         let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let lastNonEmptyLine = lines.last { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
+        let lastNonEmptyIndex = lines.lastIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let lastNonEmptyLine = lastNonEmptyIndex.map { lines[$0] } ?? ""
 
         if lastNonEmptyLine.range(of: "(yes/no/[fingerprint])", options: .caseInsensitive) != nil {
             let fingerprint = extractSHA256Fingerprint(from: normalized) ?? ""
@@ -68,7 +69,7 @@ public enum LoginPromptClassifier {
         }
 
         if lastNonEmptyLine.range(of: "Passcode or option", options: .caseInsensitive) != nil {
-            let options = parseMFAOptions(from: lines)
+            let options = parseMFAOptions(from: lines, before: lastNonEmptyIndex)
             return .mfa(options: options)
         }
 
@@ -120,20 +121,29 @@ public enum LoginPromptClassifier {
         return result
     }
 
-    private static func parseMFAOptions(from lines: [String]) -> [MFAOption] {
-        var options: [MFAOption] = []
-        for line in lines {
+    private static func parseMFAOptions(from lines: [String], before promptIndex: Int?) -> [MFAOption] {
+        guard let promptIndex, promptIndex > 0 else { return [] }
+
+        var index = promptIndex - 1
+        while index >= 0, lines[index].trimmingCharacters(in: .whitespaces).isEmpty {
+            index -= 1
+        }
+
+        var reversedOptions: [MFAOption] = []
+        while index >= 0 {
+            let line = lines[index]
             let range = NSRange(line.startIndex..<line.endIndex, in: line)
             guard let match = mfaOptionRegex.firstMatch(in: line, range: range),
                   let numberRange = Range(match.range(at: 1), in: line),
                   let labelRange = Range(match.range(at: 2), in: line),
                   let number = Int(line[numberRange]) else {
-                continue
+                break
             }
             let label = line[labelRange].trimmingCharacters(in: .whitespaces)
-            guard !label.isEmpty else { continue }
-            options.append(MFAOption(number: number, label: label))
+            guard !label.isEmpty else { break }
+            reversedOptions.append(MFAOption(number: number, label: label))
+            index -= 1
         }
-        return options
+        return reversedOptions.reversed()
     }
 }

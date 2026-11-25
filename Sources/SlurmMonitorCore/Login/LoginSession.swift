@@ -102,6 +102,7 @@ public final class LoginSession: @unchecked Sendable {
         }
         unansweredBuffer = ""
         activePrompt = nil
+        lastDeniedError = nil
         pty = process
         lock.unlock()
 
@@ -121,6 +122,7 @@ public final class LoginSession: @unchecked Sendable {
         finished = true
         unansweredBuffer = ""
         activePrompt = nil
+        lastDeniedError = nil
         pty = process
         process = nil
         driverTask = nil
@@ -200,7 +202,9 @@ public final class LoginSession: @unchecked Sendable {
         }
         finished = true
         let deniedError = lastDeniedError
-        let transcriptSnapshot = fullTranscript
+        let failureOutput = unansweredBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? fullTranscript
+            : unansweredBuffer
         process = nil
         driverTask = nil
         lock.unlock()
@@ -211,7 +215,7 @@ public final class LoginSession: @unchecked Sendable {
             let error = Self.classifyFailure(
                 exitCode: exitCode,
                 deniedError: deniedError,
-                transcript: transcriptSnapshot
+                transcript: failureOutput
             )
             continuation.yield(.failed(error))
         }

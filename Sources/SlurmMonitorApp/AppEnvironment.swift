@@ -97,6 +97,7 @@ final class AppEnvironment: ObservableObject {
 
     // Presentation hooks for WelcomeView / LoginSheet.
     @Published var isAddingCluster = false
+    @Published private(set) var isCompletingOnboarding = false
     @Published var loginQueue: [UUID] = []
     @Published private(set) var activeLoginState: ActiveLoginState?
     @Published private(set) var loginErrors: [UUID: ClusterError] = [:]
@@ -275,10 +276,7 @@ final class AppEnvironment: ObservableObject {
 
     /// Persists updated cluster definitions, regenerates the app SSH config, and refreshes non-interactively.
     func saveClusters(_ configs: [ClusterConfig], refreshTargetID: UUID? = nil) async throws {
-        try model.setClusters(configs)
-        let validIDs = Set(configs.map(\.id))
-        loginErrors = loginErrors.filter { validIDs.contains($0.key) }
-        resolvedControlPaths = resolvedControlPaths.filter { validIDs.contains($0.key) }
+        try applyAndSaveClusters(configs)
         if let refreshTargetID {
             loginErrors.removeValue(forKey: refreshTargetID)
         }
@@ -288,6 +286,56 @@ final class AppEnvironment: ObservableObject {
             syncLoginError(for: refreshTargetID)
         }
         notifyStateChanged()
+    }
+
+    /// Saves added clusters, regenerates `ssh_config`, and transitions out of onboarding or the add-cluster sheet.
+    func completeAddClusters(_ merged: [ClusterConfig], loginIDs: [UUID], isSheet: Bool) async throws {
+        if !isSheet {
+            isCompletingOnboarding = true
+        }
+        defer {
+            if !isSheet {
+                isCompletingOnboarding = false
+            }
+        }
+
+        try applyAndSaveClusters(merged)
+        await regenerateSSHConfig()
+
+        if isSheet {
+            if !loginIDs.isEmpty {
+                dismissAddClusterSheetAndLogin(loginIDs)
+            } else {
+                isAddingCluster = false
+            }
+        } else if !loginIDs.isEmpty {
+            login(loginIDs)
+        }
+        notifyStateChanged()
+    }
+
+    private func applyAndSaveClusters(_ configs: [ClusterConfig]) throws {
+        let previousByID = Dictionary(
+            model.clusters.map { ($0.config.id, $0.config) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        try model.setClusters(configs)
+
+        let validIDs = Set(configs.map(\.id))
+        let updatedByID = Dictionary(
+            configs.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        loginErrors = loginErrors.filter { id, _ in
+            guard let updated = updatedByID[id], updated.enabled else {
+                return false
+            }
+            guard let previous = previousByID[id] else {
+                return true
+            }
+            return !previous.hasConnectionChange(comparedTo: updated)
+        }
+        resolvedControlPaths = resolvedControlPaths.filter { validIDs.contains($0.key) }
     }
 
     /// Walks `ids` sequentially, probing existing shared connections and presenting `LoginSheet` only when login is required.
@@ -326,6 +374,9 @@ final class AppEnvironment: ObservableObject {
         loginGeneration &+= 1
         pendingLoginAfterAddSheet = []
         if case .session(let controller) = activeLoginState {
+            if let error = controller.recordedError {
+                loginErrors[controller.cluster.id] = error
+            }
             controller.stop()
         }
         loginTask?.cancel()
@@ -421,6 +472,32 @@ final class AppEnvironment: ObservableObject {
         model.clusters
             .filter { $0.config.enabled && $0.status != .live && $0.status != .loggingIn }
             .map(\.config.id)
+    }
+
+    /// Resolves the effective error for `view`, combining failed interactive logins with `MonitorModel.lastError`.
+    func effectiveError(for view: ClusterView) -> ClusterError? {
+        guard view.config.enabled, view.status != .live, view.status != .loggingIn else {
+            return nil
+        }
+        if let loginError = loginErrors[view.config.id] {
+            return loginError
+        }
+        if let recorded = model.lastError[view.config.id] {
+            return recorded
+        }
+        if case .error(let error) = view.status {
+            return error
+        }
+        return nil
+    }
+
+    /// Resolves the effective display status for `view`, surfacing failed interactive login errors instead of `.needsLogin`.
+    func effectiveStatus(for view: ClusterView) -> ClusterStatus {
+        guard view.config.enabled else { return view.status }
+        if case .error = view.status, let error = effectiveError(for: view) {
+            return .error(error)
+        }
+        return view.status
     }
 
     private func runLoginQueue(_ ids: [UUID], generation: UInt64) async {

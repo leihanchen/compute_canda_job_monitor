@@ -83,4 +83,22 @@ import Testing
                 == .denied(.mfaFailed)
         )
     }
+
+    @Test func mfaIgnoresNumberedPreAuthBannerLines() {
+        let bannerPlusDuo =
+            "Authorized users only. Notice:\r\n" +
+            " 1. Activity on this system may be monitored.\r\n" +
+            " 2. Do not share credentials.\r\n\r\n" +
+            "Duo two-factor login for leihan\r\n\r\n" +
+            "Enter a passcode or select one of the following options:\r\n\r\n" +
+            " 1. Duo Push to iPhone\r\n" +
+            " 2. Phone call\r\n\r\n" +
+            "Passcode or option (1-2): "
+        #expect(
+            LoginPromptClassifier.classify(bannerPlusDuo) == .mfa(options: [
+                .init(number: 1, label: "Duo Push to iPhone"),
+                .init(number: 2, label: "Phone call"),
+            ])
+        )
+    }
 }

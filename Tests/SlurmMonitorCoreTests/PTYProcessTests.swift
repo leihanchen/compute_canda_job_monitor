@@ -317,6 +317,40 @@ import Testing
         #expect(await p.waitForExit() == 0)
     }
 
+    @Test func loginSessionAnswerClearsPriorDeniedError() async throws {
+        let scriptURL = try writeMockSSHScript(
+            body: """
+            #!/bin/sh
+            printf 'Access denied\n' > /dev/tty
+            sleep 0.05
+            printf "leihan@nibi.alliancecan.ca's password: " > /dev/tty
+            IFS= read -r _ < /dev/tty
+            printf 'ssh: Could not resolve hostname bad.example: nodename nor servname provided\n' > /dev/tty
+            exit 255
+            """
+        )
+        defer { try? FileManager.default.removeItem(at: scriptURL.deletingLastPathComponent()) }
+
+        let session = LoginSession(alias: "smon-nibi", configPath: "/tmp/c", executable: scriptURL.path)
+        try session.start()
+
+        var sawPassword = false
+        var terminalEvents: [LoginEvent] = []
+        for await event in session.events {
+            switch event {
+            case .prompt(.password):
+                sawPassword = true
+                session.answer("secret")
+            case .succeeded, .failed:
+                terminalEvents.append(event)
+            case .transcript, .prompt:
+                break
+            }
+        }
+        #expect(sawPassword)
+        #expect(terminalEvents == [.failed(.unreachable)])
+    }
+
     private func writeMockSSHScript(body: String) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("slurm-monitor-pty-test-\(UUID().uuidString)", isDirectory: true)

@@ -35,6 +35,7 @@ struct WelcomeView: View {
 
     @State private var isSaving = false
     @State private var saveError: String?
+    @State private var frozenExistingClusters: [ClusterConfig]?
 
     private static let ccdbKeysURL = URL(string: "https://ccdb.alliancecan.ca/ssh_authorized_keys")!
 
@@ -67,6 +68,7 @@ struct WelcomeView: View {
         }
         .padding(isSheet ? 16 : 0)
         .frame(width: isSheet ? 410 : nil)
+        .interactiveDismissDisabled(isSheet && isSaving)
         .task {
             await loadInitialState()
         }
@@ -104,8 +106,12 @@ struct WelcomeView: View {
         }
     }
 
+    private var existingClusters: [ClusterConfig] {
+        frozenExistingClusters ?? env.model.clusters.map(\.config)
+    }
+
     private var allianceModeCard: some View {
-        let existing = env.model.clusters.map(\.config)
+        let existing = existingClusters
         let unaddedCount = AlliancePresets.all.filter { !isPresetAlreadyAdded($0, in: existing) }.count
 
         return Card("Alliance clusters") {
@@ -162,7 +168,7 @@ struct WelcomeView: View {
     }
 
     private var importModeCard: some View {
-        let existing = env.model.clusters.map(\.config)
+        let existing = existingClusters
         let needsFallbackUser = importedHosts.contains { host in
             selectedImportAliases.contains(host.alias)
                 && !isHostAlreadyAdded(host, in: existing)
@@ -271,6 +277,11 @@ struct WelcomeView: View {
 
                     SecureField("Passphrase (optional)", text: $keyPassphrase)
                         .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            if !isGeneratingKey {
+                                createKey()
+                            }
+                        }
 
                     HStack {
                         Button {
@@ -366,7 +377,7 @@ struct WelcomeView: View {
                 saveAndComplete(startLogin: false)
             }
             .controlSize(.small)
-            .disabled(!canSubmit || isSaving)
+            .disabled(!canSubmit || isSaving || isGeneratingKey)
 
             Button {
                 saveAndComplete(startLogin: true)
@@ -384,7 +395,7 @@ struct WelcomeView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
             .keyboardShortcut(.defaultAction)
-            .disabled(!canSubmit || isSaving)
+            .disabled(!canSubmit || isSaving || isGeneratingKey)
         }
     }
 
@@ -468,7 +479,7 @@ struct WelcomeView: View {
     }
 
     private var customCollisionMessage: String? {
-        let existing = env.model.clusters.map(\.config)
+        let existing = existingClusters
         let trimmedName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedHost = customHost.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUser = customUsername.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -491,7 +502,7 @@ struct WelcomeView: View {
     }
 
     private var canSubmit: Bool {
-        let existing = env.model.clusters.map(\.config)
+        let existing = existingClusters
         switch mode {
         case .alliance:
             let user = allianceUsername.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -541,9 +552,13 @@ struct WelcomeView: View {
 
         let userConfigText = (try? String(contentsOf: env.paths.userSSHConfig, encoding: .utf8)) ?? ""
         let parsedHosts = SSHConfigImporter.parseHosts(userConfigText)
-        importedHosts = parsedHosts
+        var seenAliases = Set<String>()
+        let deduplicatedHosts = parsedHosts.filter { host in
+            seenAliases.insert(host.alias.lowercased()).inserted
+        }
+        importedHosts = deduplicatedHosts
         selectedImportAliases = Set(
-            parsedHosts
+            deduplicatedHosts
                 .filter {
                     !isHostAlreadyAdded($0, in: existing)
                         && SSHConfigImporter.isKnownClusterDomain($0.hostName ?? $0.alias)
@@ -588,6 +603,7 @@ struct WelcomeView: View {
     }
 
     private func createKey() {
+        guard !isGeneratingKey else { return }
         let passphrase = keyPassphrase
         keyPassphrase = ""
         keyError = nil
@@ -624,32 +640,30 @@ struct WelcomeView: View {
     }
 
     private func saveAndComplete(startLogin: Bool) {
+        let existing = existingClusters
         let candidates = buildCandidateClusters()
-        let existing = env.model.clusters.map(\.config)
         let mergedResult = Self.merge(existing: existing, adding: candidates)
         guard !mergedResult.addedIDs.isEmpty else {
             saveError = "No new clusters selected."
             return
         }
 
+        frozenExistingClusters = existing
         isSaving = true
         saveError = nil
         keyPassphrase = ""
 
-        Task {
+        let loginIDs = startLogin ? mergedResult.addedIDs : []
+        let sheetMode = isSheet
+        Task { @MainActor in
             do {
-                try await env.saveClusters(mergedResult.merged)
-                isSaving = false
-                if isSheet {
-                    if startLogin {
-                        env.dismissAddClusterSheetAndLogin(mergedResult.addedIDs)
-                    } else {
-                        env.isAddingCluster = false
-                    }
-                } else if startLogin {
-                    env.login(mergedResult.addedIDs)
-                }
+                try await env.completeAddClusters(
+                    mergedResult.merged,
+                    loginIDs: loginIDs,
+                    isSheet: sheetMode
+                )
             } catch {
+                frozenExistingClusters = nil
                 saveError = error.localizedDescription
                 isSaving = false
             }
@@ -657,7 +671,7 @@ struct WelcomeView: View {
     }
 
     private func buildCandidateClusters() -> [ClusterConfig] {
-        let existing = env.model.clusters.map(\.config)
+        let existing = existingClusters
         let rawClusters: [ClusterConfig]
 
         switch mode {

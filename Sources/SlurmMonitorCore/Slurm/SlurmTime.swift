@@ -86,7 +86,7 @@ public enum SlurmTime {
         var total = 0
         var foundGPUEntry = false
 
-        for rawEntry in token.split(separator: ",") {
+        for rawEntry in splitTopLevelCommas(token) {
             let entry = rawEntry.trimmingCharacters(in: .whitespacesAndNewlines)
             guard entry.localizedCaseInsensitiveContains("gpu"),
                   let count = trailingGPUCount(in: entry) else {
@@ -106,11 +106,32 @@ public enum SlurmTime {
         return trimmed
     }
 
-    private static func trailingGPUCount(in entry: String) -> Int? {
-        var cleaned = entry[...]
-        if cleaned.hasSuffix(")"), let openParen = cleaned.lastIndex(of: "(") {
-            cleaned = cleaned[..<openParen]
+    private static func splitTopLevelCommas(_ text: String) -> [Substring] {
+        var entries: [Substring] = []
+        var start = text.startIndex
+        var parenDepth = 0
+
+        for index in text.indices {
+            switch text[index] {
+            case "(":
+                parenDepth += 1
+            case ")":
+                if parenDepth > 0 {
+                    parenDepth -= 1
+                }
+            case "," where parenDepth == 0:
+                entries.append(text[start..<index])
+                start = text.index(after: index)
+            default:
+                break
+            }
         }
+        entries.append(text[start...])
+        return entries
+    }
+
+    private static func trailingGPUCount(in entry: String) -> Int? {
+        let cleaned = strippingTrailingParenthetical(entry[...])
 
         let parts = cleaned.split(whereSeparator: { $0 == ":" || $0 == "=" })
         guard parts.count >= 2,
@@ -119,6 +140,27 @@ public enum SlurmTime {
             return nil
         }
         return count
+    }
+
+    private static func strippingTrailingParenthetical(_ text: Substring) -> Substring {
+        guard text.hasSuffix(")") else { return text }
+        var closeCount = 0
+        var index = text.endIndex
+        while index > text.startIndex {
+            index = text.index(before: index)
+            switch text[index] {
+            case ")":
+                closeCount += 1
+            case "(":
+                closeCount -= 1
+                if closeCount == 0 {
+                    return text[..<index]
+                }
+            default:
+                break
+            }
+        }
+        return text
     }
 
     private static func nonNegativeASCIIInt(_ text: Substring) -> Int? {

@@ -52,4 +52,15 @@ public struct ClusterConfig: Codable, Identifiable, Hashable, Sendable {
             .replacingOccurrences(of: "[^a-z0-9-]", with: "-", options: .regularExpression)
         return "smon-\(sanitized)"
     }
+
+    /// Returns `true` when any connection-defining property differs from `other`.
+    public func hasConnectionChange(comparedTo other: ClusterConfig) -> Bool {
+        sshTarget != other.sshTarget
+            || generatedAlias != other.generatedAlias
+            || host != other.host
+            || username != other.username
+            || identityFile != other.identityFile
+            || methods != other.methods
+            || requiresKey != other.requiresKey
+    }
 }

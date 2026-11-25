@@ -45,6 +45,10 @@ final class LoginSessionController: ObservableObject {
     private var isCancelled = false
     private var isFinished = false
 
+    var recordedError: ClusterError? {
+        terminalError
+    }
+
     private static let maxTranscriptCharacters = 8_192
     private static let maxTranscriptLines = 120
 

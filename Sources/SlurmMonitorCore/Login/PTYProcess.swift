@@ -188,6 +188,7 @@ public final class PTYProcess: @unchecked Sendable {
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + .milliseconds(50))
             timer.setEventHandler { [weak self] in
+                self?.drainMasterFD()
                 self?.finishOutputStream()
                 self?.resolveWaitersIfReady()
             }

@@ -55,7 +55,8 @@ struct ClustersTab: View {
     }
 
     private func clusterCard(_ view: ClusterView) -> some View {
-        let activeError = resolvedError(for: view)
+        let effectiveStatus = env.effectiveStatus(for: view)
+        let activeError = env.effectiveError(for: view)
         let lastSuccessText: String = {
             if let fetchedAt = view.snapshot?.fetchedAt {
                 return "Last success \(Dashboard.ageText(now.timeIntervalSince(fetchedAt)))"
@@ -66,7 +67,7 @@ struct ClustersTab: View {
         return Card {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
-                    StatusDot(status: view.status, enabled: view.config.enabled)
+                    StatusDot(status: effectiveStatus, enabled: view.config.enabled)
                     Text(view.config.name)
                         .font(.callout.weight(.semibold))
                         .lineLimit(1)
@@ -76,9 +77,9 @@ struct ClustersTab: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 4)
-                    Text(SlurmDisplayFormatter.statusSummary(for: view, now: now))
+                    Text(SlurmDisplayFormatter.statusSummary(for: view, effectiveStatus: effectiveStatus, now: now))
                         .font(.caption2.weight(.medium))
-                        .foregroundStyle(statusTextColor(for: view))
+                        .foregroundStyle(statusTextColor(for: effectiveStatus, enabled: view.config.enabled))
                 }
 
                 if let activeError {
@@ -148,23 +149,9 @@ struct ClustersTab: View {
             )
     }
 
-    private func resolvedError(for view: ClusterView) -> ClusterError? {
-        guard view.status != .live else { return nil }
-        if let loginError = env.loginErrors[view.config.id] {
-            return loginError
-        }
-        if let recorded = env.model.lastError[view.config.id] {
-            return recorded
-        }
-        if case .error(let error) = view.status {
-            return error
-        }
-        return nil
-    }
-
-    private func statusTextColor(for view: ClusterView) -> Color {
-        guard view.config.enabled else { return .secondary }
-        switch view.status {
+    private func statusTextColor(for status: ClusterStatus, enabled: Bool) -> Color {
+        guard enabled else { return .secondary }
+        switch status {
         case .live:
             return .green
         case .stale, .loggingIn:
@@ -243,6 +230,20 @@ private struct EditClusterSheet: View {
                 Toggle("Enabled", isOn: $enabled)
             }
             .formStyle(.grouped)
+
+            if !sshAlias.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("When SSH alias is set, ~/.ssh/config controls host and user settings via ssh -G.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let aliasCollisionMessage {
+                Text(aliasCollisionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             snippetCard
 
@@ -348,13 +349,27 @@ private struct EditClusterSheet: View {
         )
     }
 
+    private var aliasCollisionMessage: String? {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return nil }
+        let candidateAlias = draftCluster.generatedAlias.lowercased()
+        let collides = env.model.clusters.contains { view in
+            view.config.id != original.id
+                && view.config.generatedAlias.lowercased() == candidateAlias
+        }
+        guard collides else { return nil }
+        return "Another cluster already uses generated SSH alias '\(draftCluster.generatedAlias)'. Choose a different name."
+    }
+
     private var isValid: Bool {
         !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && aliasCollisionMessage == nil
     }
 
     private func saveChanges() {
+        guard isValid else { return }
         let updated = draftCluster
 
         isSaving = true

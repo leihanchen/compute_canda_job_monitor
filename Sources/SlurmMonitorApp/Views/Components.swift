@@ -285,9 +285,13 @@ enum SlurmDisplayFormatter {
         }
     }
 
-    static func statusSummary(for view: ClusterView, now: Date) -> String {
+    static func statusSummary(
+        for view: ClusterView,
+        effectiveStatus: ClusterStatus? = nil,
+        now: Date
+    ) -> String {
         guard view.config.enabled else { return "disabled" }
-        switch view.status {
+        switch effectiveStatus ?? view.status {
         case .live:
             return "live"
         case .stale:

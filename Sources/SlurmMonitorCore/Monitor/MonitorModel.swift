@@ -98,6 +98,7 @@ public final class MonitorModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                guard !Task.isCancelled else { return }
                 recordFailure(id: id, epoch: epoch, error: mapQueryError(error))
             }
         }
@@ -139,10 +140,7 @@ public final class MonitorModel: ObservableObject {
 
         clusters = configs.map { config in
             if var existing = existingByID[config.id] {
-                let connectionChanged =
-                    existing.config.sshTarget != config.sshTarget
-                    || existing.config.identityFile != config.identityFile
-                    || existing.config.methods != config.methods
+                let connectionChanged = existing.config.hasConnectionChange(comparedTo: config)
 
                 if existing.snapshot == nil, let cached = cache.load(config.id) {
                     existing.snapshot = cached
@@ -151,14 +149,16 @@ public final class MonitorModel: ObservableObject {
                     }
                 }
 
-                if connectionChanged, existing.status != .loggingIn {
+                if connectionChanged || !config.enabled {
                     lastError.removeValue(forKey: config.id)
                     _ = bumpEpoch(for: config.id)
                     existing.methodInUse = nil
-                    existing.status = existing.snapshot != nil ? .stale : .error(.needsLogin)
-                } else if !config.enabled, existing.status != .loggingIn {
-                    existing.methodInUse = nil
-                    existing.status = existing.snapshot != nil ? .stale : .error(.needsLogin)
+                    let resetStatus: ClusterStatus = existing.snapshot != nil ? .stale : .error(.needsLogin)
+                    if existing.status == .loggingIn {
+                        preLoginStatus[config.id] = resetStatus
+                    } else {
+                        existing.status = resetStatus
+                    }
                 }
 
                 existing.config = config

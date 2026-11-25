@@ -62,10 +62,7 @@ struct SettingsView: View {
 
     private func syncLaunchAtLoginIfBundled() {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
-        let isEnabled = SMAppService.mainApp.status == .enabled
-        if env.settings.launchAtLogin != isEnabled {
-            env.settings.launchAtLogin = isEnabled
-        }
+        applyServiceStatus(SMAppService.mainApp.status)
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
@@ -73,13 +70,41 @@ struct SettingsView: View {
         do {
             if enabled {
                 try SMAppService.mainApp.register()
+                let status = SMAppService.mainApp.status
+                if status == .requiresApproval {
+                    applyServiceStatus(status)
+                } else {
+                    env.settings.launchAtLogin = true
+                }
             } else {
                 try SMAppService.mainApp.unregister()
+                env.settings.launchAtLogin = false
             }
-            env.settings.launchAtLogin = enabled
         } catch {
             env.settings.launchAtLogin = !enabled
             launchAtLoginMessage = "Could not update Login Items in this build: \(error.localizedDescription)"
+        }
+    }
+
+    private func applyServiceStatus(_ status: SMAppService.Status) {
+        switch status {
+        case .enabled:
+            if !env.settings.launchAtLogin {
+                env.settings.launchAtLogin = true
+            }
+            launchAtLoginMessage = nil
+        case .requiresApproval:
+            if !env.settings.launchAtLogin {
+                env.settings.launchAtLogin = true
+            }
+            launchAtLoginMessage = "Waiting for approval in System Settings → Login Items"
+        case .notRegistered, .notFound:
+            if env.settings.launchAtLogin {
+                env.settings.launchAtLogin = false
+            }
+            launchAtLoginMessage = nil
+        @unknown default:
+            break
         }
     }
 }

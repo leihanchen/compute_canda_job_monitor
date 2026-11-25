@@ -39,7 +39,7 @@ struct PanelView: View {
             VStack(alignment: .leading, spacing: 10) {
                 header(dashboard: dashboard, now: now)
 
-                if env.model.clusters.isEmpty {
+                if env.model.clusters.isEmpty || env.isCompletingOnboarding {
                     WelcomeView(isSheet: false)
                 } else {
                     Picker("Section", selection: $selectedTab) {
@@ -117,6 +117,7 @@ struct PanelView: View {
                     }
                 }
                 .buttonStyle(.borderless)
+                .disabled(env.isRefreshing)
                 .help("Refresh all clusters now")
                 .accessibilityLabel("Refresh all clusters")
             }
