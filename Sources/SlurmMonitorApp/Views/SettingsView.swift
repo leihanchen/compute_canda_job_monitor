@@ -38,6 +38,16 @@ struct SettingsView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 4) {
+                Toggle("Show in Dock", isOn: $env.settings.showInDock)
+                Text("Clicking the Dock icon opens this panel. The menu bar item is always shown.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
                 Toggle(
                     "Launch at login",
                     isOn: Binding(

@@ -4,6 +4,7 @@ import SwiftUI
 
 @main
 struct SlurmMonitorApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var env = AppEnvironment()
 
     var body: some Scene {

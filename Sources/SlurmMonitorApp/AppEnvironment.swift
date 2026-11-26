@@ -90,6 +90,9 @@ final class AppEnvironment: ObservableObject {
             if settings.stayAwakeWhilePluggedIn != oldValue.stayAwakeWhilePluggedIn {
                 notifyStateChanged()
             }
+            if settings.showInDock != oldValue.showInDock {
+                DockPresence.apply(showInDock: settings.showInDock)
+            }
         }
     }
 

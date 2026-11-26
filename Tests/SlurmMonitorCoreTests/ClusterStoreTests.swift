@@ -59,6 +59,20 @@ import Testing
 @Test func settingsDefaults() {
     let s = AppSettings()
     #expect(s.refreshIntervalMinutes == 5 && s.stayAwakeWhilePluggedIn == false && s.launchAtLogin == false)
+    #expect(s.showInDock == true)
+}
+
+@Test func settingsFromOlderVersionKeepValuesAndDefaultShowInDock() throws {
+    let suiteName = "ClusterStoreTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let legacy = #"{"refreshIntervalMinutes":12,"stayAwakeWhilePluggedIn":true,"launchAtLogin":false}"#
+    defaults.set(Data(legacy.utf8), forKey: "appSettings")
+    let loaded = AppSettings.load(from: defaults)
+    #expect(loaded.refreshIntervalMinutes == 12)
+    #expect(loaded.stayAwakeWhilePluggedIn == true)
+    #expect(loaded.showInDock == true)
 }
 
 @Test func settingsRoundTripsUserDefaults() throws {
@@ -68,7 +82,7 @@ import Testing
 
     #expect(AppSettings.load(from: defaults) == AppSettings())
 
-    let custom = AppSettings(refreshIntervalMinutes: 10, stayAwakeWhilePluggedIn: true, launchAtLogin: true)
+    let custom = AppSettings(refreshIntervalMinutes: 10, stayAwakeWhilePluggedIn: true, launchAtLogin: true, showInDock: false)
     custom.save(to: defaults)
     #expect(AppSettings.load(from: defaults) == custom)
 }

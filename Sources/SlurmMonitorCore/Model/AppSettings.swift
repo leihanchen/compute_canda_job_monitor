@@ -7,15 +7,35 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var refreshIntervalMinutes: Int
     public var stayAwakeWhilePluggedIn: Bool
     public var launchAtLogin: Bool
+    /// Shows the app icon in the Dock (in addition to the menu bar item).
+    public var showInDock: Bool
 
     public init(
         refreshIntervalMinutes: Int = 5,
         stayAwakeWhilePluggedIn: Bool = false,
-        launchAtLogin: Bool = false
+        launchAtLogin: Bool = false,
+        showInDock: Bool = true
     ) {
         self.refreshIntervalMinutes = refreshIntervalMinutes
         self.stayAwakeWhilePluggedIn = stayAwakeWhilePluggedIn
         self.launchAtLogin = launchAtLogin
+        self.showInDock = showInDock
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case refreshIntervalMinutes, stayAwakeWhilePluggedIn, launchAtLogin, showInDock
+    }
+
+    /// Missing keys fall back to defaults so settings saved by older versions still load.
+    public init(from decoder: Decoder) throws {
+        let defaults = AppSettings()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        refreshIntervalMinutes = try c.decodeIfPresent(Int.self, forKey: .refreshIntervalMinutes)
+            ?? defaults.refreshIntervalMinutes
+        stayAwakeWhilePluggedIn = try c.decodeIfPresent(Bool.self, forKey: .stayAwakeWhilePluggedIn)
+            ?? defaults.stayAwakeWhilePluggedIn
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? defaults.launchAtLogin
+        showInDock = try c.decodeIfPresent(Bool.self, forKey: .showInDock) ?? defaults.showInDock
     }
 
     /// Loads saved settings from `defaults`, returning defaults when absent or unreadable.

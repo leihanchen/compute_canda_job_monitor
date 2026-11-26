@@ -36,6 +36,13 @@ cp "$BINARY_PATH" "$MACOS_DIR/SlurmMonitorApp"
 chmod +x "$MACOS_DIR/SlurmMonitorApp"
 cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
 
+ICON_FILE="$ROOT_DIR/Resources/AppIcon.icns"
+if [[ -f "$ICON_FILE" ]]; then
+    cp "$ICON_FILE" "$RESOURCES_DIR/AppIcon.icns"
+else
+    echo "Warning: $ICON_FILE not found; run 'swift scripts/make-icon.swift' to generate it." >&2
+fi
+
 # Optional version stamping (used by the release workflow), applied before signing.
 # APP_VERSION accepts "1.2.3" or "v1.2.3"; BUILD_NUMBER sets CFBundleVersion.
 if [[ -n "${APP_VERSION:-}" ]]; then
