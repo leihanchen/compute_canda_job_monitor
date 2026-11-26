@@ -1,0 +1,81 @@
+name: Release
+
+# Push a tag like `v0.1.0` (or `v0.2.0-beta.1` for a pre-release) to publish:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build app bundle
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: ./scripts/build-app.sh
+
+      - name: Package release assets
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent \
+            "build/Slurm Monitor.app" "dist/SlurmMonitor-${VERSION}-macOS.zip"
+          git archive --format=zip \
+            --prefix="compute_canada_job_monitor-${VERSION}/" \
+            -o "dist/compute_canada_job_monitor-${VERSION}-source.zip" "${TAG}"
+          (cd dist && shasum -a 256 *.zip > SHA256SUMS.txt)
+          ls -l dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            FLAGS=()
+            if [[ "$PRERELEASE" == "true" ]]; then FLAGS+=(--prerelease); fi
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "Slurm Monitor ${TAG}" \
+              --notes-file .github/release-notes.md \
+              --generate-notes \
+              "${FLAGS[@]}"
+          fi

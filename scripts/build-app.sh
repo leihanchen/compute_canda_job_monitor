@@ -36,6 +36,15 @@ cp "$BINARY_PATH" "$MACOS_DIR/SlurmMonitorApp"
 chmod +x "$MACOS_DIR/SlurmMonitorApp"
 cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
 
+# Optional version stamping (used by the release workflow), applied before signing.
+# APP_VERSION accepts "1.2.3" or "v1.2.3"; BUILD_NUMBER sets CFBundleVersion.
+if [[ -n "${APP_VERSION:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION#v}" "$CONTENTS_DIR/Info.plist"
+fi
+if [[ -n "${BUILD_NUMBER:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "$CONTENTS_DIR/Info.plist"
+fi
+
 plutil -lint "$CONTENTS_DIR/Info.plist"
 
 codesign --force --deep --sign - "$APP_DIR"
