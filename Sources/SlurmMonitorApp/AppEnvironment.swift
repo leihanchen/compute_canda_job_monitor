@@ -685,7 +685,11 @@ final class AppEnvironment: ObservableObject {
         let appTemplate = paths.socketTemplate
         let runner = self.runner
 
-        let resolvedResults = await withTaskGroup(of: (Int, UUID, String, String).self) { group in
+        // Collect plain results first, then assemble outside the task group. Returning a
+        // tuple of collections straight out of `withTaskGroup` miscompiled under `-c release`
+        // (SIGSEGV reading the array buffer in `GeneratedSSHConfig.write`).
+        var results: [ResolvedClusterBlock] = []
+        await withTaskGroup(of: ResolvedClusterBlock.self) { group in
             for (index, cluster) in enabledClusters.enumerated() {
                 group.addTask {
                     let resolved = await ControlPathResolver.resolve(
@@ -699,22 +703,26 @@ final class AppEnvironment: ObservableObject {
                         sshG: resolved.sshG,
                         controlPath: resolved.controlPath
                     )
-                    return (index, cluster.id, block, resolved.controlPath)
+                    return ResolvedClusterBlock(
+                        index: index, id: cluster.id, block: block, controlPath: resolved.controlPath
+                    )
                 }
             }
-
-            var orderedBlocks = Array(repeating: "", count: enabledClusters.count)
-            var pathsByID: [UUID: String] = [:]
-            for await (index, id, block, controlPath) in group {
-                orderedBlocks[index] = block
-                pathsByID[id] = controlPath
+            for await result in group {
+                results.append(result)
             }
-            return (orderedBlocks, pathsByID)
+        }
+
+        results.sort { $0.index < $1.index }
+        let orderedBlocks = results.map(\.block)
+        var pathsByID: [UUID: String] = [:]
+        for result in results {
+            pathsByID[result.id] = result.controlPath
         }
 
         do {
-            try GeneratedSSHConfig.write(blocks: resolvedResults.0, to: paths.sshConfig)
-            resolvedControlPaths = resolvedResults.1
+            try GeneratedSSHConfig.write(blocks: orderedBlocks, to: paths.sshConfig)
+            resolvedControlPaths = pathsByID
             lastUserSSHConfigMTime = mtime
             hasGeneratedSSHConfig = true
         } catch {
@@ -753,4 +761,12 @@ final class AppEnvironment: ObservableObject {
     private static func clampedIntervalMinutes(_ value: Int) -> Int {
         max(1, min(30, value))
     }
+}
+
+/// One cluster's generated `ssh_config` block plus its resolved socket path.
+private struct ResolvedClusterBlock: Sendable {
+    let index: Int
+    let id: UUID
+    let block: String
+    let controlPath: String
 }
