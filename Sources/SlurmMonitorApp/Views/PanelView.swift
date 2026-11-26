@@ -31,6 +31,10 @@ struct PanelView: View {
     @State private var selectedTab: PanelTab = .overview
     @State private var showingSettings = false
 
+    // User-adjustable panel size, persisted across launches.
+    @AppStorage("panelWidth") private var panelWidth: Double = PanelSize.defaultWidth
+    @AppStorage("panelContentHeight") private var contentHeight: Double = PanelSize.defaultContentHeight
+
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let now = context.date
@@ -54,14 +58,14 @@ struct PanelView: View {
                         tabContent(now: now)
                             .padding(.vertical, 2)
                     }
-                    .frame(maxHeight: 460)
+                    .frame(height: PanelSize.clampedContentHeight(contentHeight))
                 }
 
                 Divider()
                 footer
             }
             .padding(12)
-            .frame(width: 380)
+            .frame(width: PanelSize.clampedWidth(panelWidth))
         }
         .onAppear {
             Task {
@@ -166,6 +170,8 @@ struct PanelView: View {
             .buttonStyle(.borderless)
             .help("Quit Slurm Monitor")
             .accessibilityLabel("Quit")
+
+            ResizeGrip(width: $panelWidth, contentHeight: $contentHeight)
         }
     }
 
