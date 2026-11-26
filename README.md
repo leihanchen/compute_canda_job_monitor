@@ -40,8 +40,8 @@ Slurm Monitor logs in **once per cluster**, keeps that authenticated SSH connect
 
 ### Option A: download a release
 
-1. Open the repository's **Releases** page and download `SlurmMonitor-<version>-macOS.zip`.
-2. Unzip it and move **Slurm Monitor.app** to `/Applications`.
+1. Open the repository's **Releases** page and download `SlurmMonitor-<version>-macOS.dmg`. The `-source.zip` contains only source code.
+2. Open the disk image and drag **Slurm Monitor.app** onto the **Applications** shortcut.
 3. The app is ad-hoc signed (not notarized by Apple), so macOS blocks the first launch. Either right-click the app → **Open** → **Open**, or run:
 
    ```bash
@@ -171,7 +171,7 @@ Project layout:
 
 ### Releasing
 
-Push a version tag; GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs the tests, builds the app, and publishes a release with the app zip, a source zip and `SHA256SUMS.txt`:
+Push a version tag; GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs the tests, builds the app, and publishes a release with the app as a `.dmg`, a source-only zip and `SHA256SUMS.txt`:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0     # tags with a hyphen (v0.2.0-beta.1) become pre-releases

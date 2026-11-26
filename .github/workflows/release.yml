@@ -53,12 +53,21 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
-          ditto -c -k --keepParent \
-            "build/Slurm Monitor.app" "dist/SlurmMonitor-${VERSION}-macOS.zip"
+
+          # App: a standalone disk image (drag the app onto the Applications shortcut).
+          STAGE="$(mktemp -d)"
+          ditto "build/Slurm Monitor.app" "${STAGE}/Slurm Monitor.app"
+          ln -s /Applications "${STAGE}/Applications"
+          hdiutil create -volname "Slurm Monitor ${VERSION}" -srcfolder "${STAGE}" \
+            -fs HFS+ -format UDZO -ov "dist/SlurmMonitor-${VERSION}-macOS.dmg"
+          rm -rf "${STAGE}"
+
+          # Source: the tagged tree only (no build output).
           git archive --format=zip \
             --prefix="compute_canada_job_monitor-${VERSION}/" \
             -o "dist/compute_canada_job_monitor-${VERSION}-source.zip" "${TAG}"
-          (cd dist && shasum -a 256 *.zip > SHA256SUMS.txt)
+
+          (cd dist && shasum -a 256 *.dmg *.zip > SHA256SUMS.txt)
           ls -l dist
 
       - name: Publish GitHub release
